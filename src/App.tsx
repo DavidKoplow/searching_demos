@@ -468,7 +468,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
 }
 
 function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number, TileId[]>) {
-  const { tree, activeNodeId, phase, rolloutTiles } = frame
+  const { tree, activeNodeId } = frame
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
   graph.setGraph({
@@ -513,8 +513,7 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
     const position = graph.node(String(node.id))
     const parentTile = node.parentId === null ? null : nodeById.get(node.parentId)?.tile ?? null
     const simulationPath = rolloutPathByNodeId.get(node.id) ?? []
-    const simulationIndicatorToTile =
-      phase === 'rollout' && node.id === activeNodeId ? (rolloutTiles[1] ?? null) : null
+    const simulationIndicatorToTile = simulationPath[1] ?? null
 
     return {
       id: String(node.id),
@@ -813,7 +812,8 @@ function App() {
   const [playbackMs, setPlaybackMs] = useState(550)
   const [mctsIterations, setMctsIterations] = useState(40)
   const [mctsExplorationC, setMctsExplorationC] = useState(Math.SQRT2)
-  const [mctsHorizon, setMctsHorizon] = useState(6)
+  const [mctsGamma, setMctsGamma] = useState(0.9)
+  const [mctsHorizon, setMctsHorizon] = useState(10)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
   const tokenAnimationCounterRef = useRef(0)
   const tokenAnimationTimerRef = useRef<number | null>(null)
@@ -1024,6 +1024,7 @@ function App() {
       goal: goalTile,
       iterations: mctsIterations,
       explorationConstant: mctsExplorationC,
+      gamma: mctsGamma,
       rolloutHorizon: mctsHorizon,
     })
     const executionFrames = buildExecutionFrames(result.recommendedPath, result.recommendedActions).map(
@@ -1034,7 +1035,7 @@ function App() {
     )
     setDemoFrames([...result.frames, ...executionFrames])
     setDemoIndex(0)
-  }, [algorithm, clearTokenAnimation, currentTile, goalTile, mctsExplorationC, mctsHorizon, mctsIterations])
+  }, [algorithm, clearTokenAnimation, currentTile, goalTile, mctsExplorationC, mctsGamma, mctsHorizon, mctsIterations])
 
   useEffect(() => {
     if (!isAutoPlay || demoFrames.length === 0) {
@@ -1355,10 +1356,25 @@ function App() {
                     onChange={(event) => setMctsHorizon(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
                   />
                 </label>
+                <label>
+                  Gamma
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={mctsGamma}
+                    onChange={(event) =>
+                      setMctsGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                    }
+                  />
+                </label>
               </div>
             ) : (
               <p className="explanation-text">
-                A* assumption: deterministic transitions only; stuck-tile randomness is ignored.
+                A* uses expected turn cost for edge weights. A normal move costs 1 turn, while
+                leaving a stuck tile in the chosen direction costs 2 expected turns when the move
+                succeeds with probability 0.5.
               </p>
             )}
 
@@ -1516,16 +1532,16 @@ function App() {
                     <strong>{displayedAStarFrame.openSet.length}</strong>
                   </div>
                   <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Distance g</span>
-                    <strong>{astarCurrentScores?.g ?? '-'}</strong>
+                    <span className="mcts-metric-label">Expected turns g</span>
+                    <strong>{formatAStarScore(astarCurrentScores?.g ?? null)}</strong>
                   </div>
                   <div className="mcts-metric-card">
                     <span className="mcts-metric-label">Heuristic h</span>
                     <strong>{astarCurrentScores?.h ?? '-'}</strong>
                   </div>
                   <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Estimated total f</span>
-                    <strong>{astarCurrentScores?.f ?? '-'}</strong>
+                    <span className="mcts-metric-label">Expected total f</span>
+                    <strong>{formatAStarScore(astarCurrentScores?.f ?? null)}</strong>
                   </div>
                   <div className="mcts-metric-card">
                     <span className="mcts-metric-label">Neighbor under test</span>
@@ -1566,6 +1582,9 @@ function App() {
                 </span>
                 <span>
                   <strong>UCB c</strong>: {displayedMCTSFrame.explorationConstant.toFixed(3)}
+                </span>
+                <span>
+                  <strong>Gamma</strong>: {displayedMCTSFrame.gamma.toFixed(3)}
                 </span>
               </div>
             </div>

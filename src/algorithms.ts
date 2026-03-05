@@ -1,6 +1,7 @@
 import {
   ACTIONS,
   deterministicTransition,
+  expectedTurnsForDestination,
   getAllTiles,
   getTileType,
   sampleTransition,
@@ -100,6 +101,7 @@ export type MCTSFrame = {
   step: number
   iteration: number
   explorationConstant: number
+  gamma: number
   phase: MCTSFramePhase
   message: string
   activeNodeId: number | null
@@ -127,6 +129,7 @@ type MCTSConfig = {
   goal: TileId
   iterations: number
   explorationConstant: number
+  gamma: number
   rolloutHorizon: number
   rng?: () => number
 }
@@ -234,7 +237,7 @@ function snapshotAStarTree(
 export function runAStarDemo(config: AStarConfig): AStarResult {
   const { start, goal } = config
   const deterministicAssumption =
-    'A* demo assumes deterministic transitions and ignores stuck-tile stochastic outcomes.'
+    'A* uses expected turn cost for each action outcome; leaving a stuck tile in a successful direction costs 2 expected turns.'
 
   const openSet = new Set<TileId>([start])
   const closedSet = new Set<TileId>()
@@ -308,7 +311,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
 
       pushFrame({
         phase: 'goal-found',
-        message: `Goal ${goal} reached. Final path contains ${finalPath.length - 1} moves.`,
+        message: `Goal ${goal} reached. Final plan uses ${finalPath.length - 1} actions with expected cost ${gScore[current] ?? 0}.`,
         current,
         action: null,
         neighbor: null,
@@ -344,11 +347,12 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
 
     for (const action of ACTIONS) {
       const neighbor = deterministicTransition(current, action).destination
-      const tentativeG = (gScore[current] ?? Number.POSITIVE_INFINITY) + 1
+      const stepCost = expectedTurnsForDestination(current, action, neighbor)
+      const tentativeG = (gScore[current] ?? Number.POSITIVE_INFINITY) + stepCost
 
       pushFrame({
         phase: 'consider-neighbor',
-        message: `Considering ${action} from ${current} to ${neighbor}.`,
+        message: `Considering ${action} from ${current} to ${neighbor} with expected step cost ${stepCost}.`,
         current,
         action,
         neighbor,
@@ -408,7 +412,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
         const preview = reconstructPath(cameFrom, neighbor).tiles
         pushFrame({
           phase: 'update-neighbor',
-          message: `Updated ${neighbor}: g=${tentativeG}, f=${fScore[neighbor]}.`,
+          message: `Updated ${neighbor}: expected g=${tentativeG}, f=${fScore[neighbor]}.`,
           current,
           action,
           neighbor,
@@ -535,6 +539,15 @@ function rewardForTile(tile: TileId, goal: TileId) {
   return 0
 }
 
+function discountedRewardForTile(tile: TileId, goal: TileId, stepsAhead: number, gamma: number) {
+  const baseReward = rewardForTile(tile, goal)
+  if (baseReward === 0) {
+    return 0
+  }
+
+  return Math.pow(gamma, Math.max(0, stepsAhead)) * baseReward
+}
+
 function createRng(defaultRng?: () => number) {
   if (defaultRng) {
     return defaultRng
@@ -548,7 +561,7 @@ function createRng(defaultRng?: () => number) {
 }
 
 export function runMCTSDemo(config: MCTSConfig): MCTSResult {
-  const { start, goal, explorationConstant, iterations, rolloutHorizon } = config
+  const { start, goal, explorationConstant, gamma, iterations, rolloutHorizon } = config
   const rng = createRng(config.rng)
 
   const frames: MCTSFrame[] = []
@@ -596,7 +609,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
   const pushFrame = (
     payload: Omit<
       MCTSFrame,
-      'kind' | 'step' | 'bestRootAction' | 'bestRootVisits' | 'tree' | 'explorationConstant'
+      'kind' | 'step' | 'bestRootAction' | 'bestRootVisits' | 'tree' | 'explorationConstant' | 'gamma'
     >,
   ) => {
     const best = getBestRootAction()
@@ -604,6 +617,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       kind: 'mcts',
       step: step++,
       explorationConstant,
+      gamma,
       bestRootAction: best.action,
       bestRootVisits: best.visits,
       tree: snapshotTree(nodes, explorationConstant),
@@ -614,7 +628,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
   pushFrame({
     iteration: 0,
     phase: 'init',
-    message: `Initialized MCTS at ${start} with c=${explorationConstant.toFixed(3)} and horizon=${rolloutHorizon}.`,
+    message: `Initialized MCTS at ${start} with c=${explorationConstant.toFixed(3)}, gamma=${gamma.toFixed(3)}, and horizon=${rolloutHorizon}.`,
     activeNodeId: root.id,
     selectionPathIds: [root.id],
     rolloutTiles: [start],
@@ -722,7 +736,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       rolloutTiles,
     })
 
-    const reward = rewardForTile(rolloutState, goal)
+    let reward = discountedRewardForTile(rolloutState, goal, rolloutTiles.length - 1, gamma)
     for (let pathIndex = selectionPath.length - 1; pathIndex >= 0; pathIndex -= 1) {
       const nodeId = selectionPath[pathIndex]
       const node = nodes.get(nodeId)
@@ -740,6 +754,8 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
         selectionPathIds: [...selectionPath],
         rolloutTiles,
       })
+
+      reward *= gamma
     }
 
     pushFrame({

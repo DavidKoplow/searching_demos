@@ -262,6 +262,22 @@ export function sampleTransition(tile: TileId, action: Action, rng: () => number
   }
 }
 
+export function expectedTurnsForDestination(tile: TileId, action: Action, destination: TileId) {
+  const probability = transitionForAction(tile, action).outcomes.reduce((total, outcome) => {
+    if (outcome.destination !== destination) {
+      return total
+    }
+
+    return total + outcome.probability
+  }, 0)
+
+  if (probability <= 0) {
+    return Number.POSITIVE_INFINITY
+  }
+
+  return 1 / probability
+}
+
 export function deterministicTransition(tile: TileId, action: Action): MoveAttempt {
   if (getTileType(tile) === 'T') {
     return {
