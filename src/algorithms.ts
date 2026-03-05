@@ -1,0 +1,805 @@
+import {
+  ACTIONS,
+  deterministicTransition,
+  getAllTiles,
+  getTileType,
+  sampleTransition,
+  type Action,
+  type TileId,
+} from './game'
+
+export type AlgorithmKind = 'astar' | 'mcts'
+
+export type AStarFramePhase =
+  | 'init'
+  | 'expand'
+  | 'consider-neighbor'
+  | 'update-neighbor'
+  | 'skip-neighbor'
+  | 'goal-found'
+  | 'finished'
+
+export type AStarFrame = {
+  kind: 'astar'
+  step: number
+  phase: AStarFramePhase
+  message: string
+  deterministicAssumption: string
+  current: TileId | null
+  action: Action | null
+  neighbor: TileId | null
+  openSet: TileId[]
+  closedSet: TileId[]
+  pathPreview: TileId[]
+  reachedGoal: boolean
+  scoreRows: Array<{
+    tile: TileId
+    g: number | null
+    h: number
+    f: number | null
+    parent: TileId | null
+    actionFromParent: Action | null
+  }>
+  activeTreeNodeId: number | null
+  tree: AStarTreeNodeSnapshot[]
+  rejectedChild: {
+    tile: TileId
+    parentTreeNodeId: number
+    actionFromParent: Action
+    g: number
+    h: number
+    f: number
+    reason: 'already-closed' | 'not-better'
+  } | null
+}
+
+export type AStarResult = {
+  frames: AStarFrame[]
+  path: TileId[]
+  actions: Action[]
+  reachedGoal: boolean
+}
+
+export type MCTSFramePhase =
+  | 'init'
+  | 'selection'
+  | 'expansion'
+  | 'rollout'
+  | 'backprop'
+  | 'iteration-end'
+  | 'finished'
+
+export type MCTSTreeNodeSnapshot = {
+  id: number
+  tile: TileId
+  parentId: number | null
+  actionFromParent: Action | null
+  visits: number
+  valueSum: number
+  depth: number
+  parentVisits: number | null
+  ucb: number | null
+}
+
+export type AStarTreeNodeStatus = 'active' | 'queued' | 'pruned'
+
+export type AStarTreeNodeSnapshot = {
+  id: number
+  tile: TileId
+  parentId: number | null
+  actionFromParent: Action | null
+  depth: number
+  g: number
+  h: number
+  f: number
+  status: AStarTreeNodeStatus
+}
+
+export type MCTSFrame = {
+  kind: 'mcts'
+  step: number
+  iteration: number
+  explorationConstant: number
+  phase: MCTSFramePhase
+  message: string
+  activeNodeId: number | null
+  selectionPathIds: number[]
+  rolloutTiles: TileId[]
+  tree: MCTSTreeNodeSnapshot[]
+  bestRootAction: Action | null
+  bestRootVisits: number
+}
+
+export type MCTSResult = {
+  frames: MCTSFrame[]
+  tree: MCTSTreeNodeSnapshot[]
+  recommendedPath: TileId[]
+  recommendedActions: Action[]
+}
+
+type AStarConfig = {
+  start: TileId
+  goal: TileId
+}
+
+type MCTSConfig = {
+  start: TileId
+  goal: TileId
+  iterations: number
+  explorationConstant: number
+  rolloutHorizon: number
+  rng?: () => number
+}
+
+type InternalMCTSNode = {
+  id: number
+  tile: TileId
+  parentId: number | null
+  actionFromParent: Action | null
+  depth: number
+  visits: number
+  valueSum: number
+  untriedActions: Action[]
+  childrenByAction: Partial<Record<Action, number>>
+}
+
+type InternalAStarTreeNode = {
+  id: number
+  tile: TileId
+  parentId: number | null
+  actionFromParent: Action | null
+  depth: number
+  g: number
+  h: number
+  f: number
+}
+
+function parseTile(tile: TileId) {
+  const [row, column] = [...tile] as [`${1 | 2 | 3}`, string]
+  return { row: Number(row), column }
+}
+
+function manhattanDistance(source: TileId, target: TileId) {
+  const sourceParsed = parseTile(source)
+  const targetParsed = parseTile(target)
+  const sourceColumn = sourceParsed.column.charCodeAt(0) - 65
+  const targetColumn = targetParsed.column.charCodeAt(0) - 65
+  return Math.abs(sourceParsed.row - targetParsed.row) + Math.abs(sourceColumn - targetColumn)
+}
+
+function reconstructPath(cameFrom: Partial<Record<TileId, { prev: TileId; action: Action }>>, end: TileId) {
+  const tiles: TileId[] = [end]
+  const actions: Action[] = []
+  let cursor = end
+
+  while (cameFrom[cursor]) {
+    const entry = cameFrom[cursor]
+    if (!entry) {
+      break
+    }
+    tiles.unshift(entry.prev)
+    actions.unshift(entry.action)
+    cursor = entry.prev
+  }
+
+  return { tiles, actions }
+}
+
+function makeScoreRows(
+  gScore: Partial<Record<TileId, number>>,
+  fScore: Partial<Record<TileId, number>>,
+  cameFrom: Partial<Record<TileId, { prev: TileId; action: Action }>>,
+  goal: TileId,
+) {
+  return getAllTiles().map((tile) => ({
+    tile,
+    g: gScore[tile] ?? null,
+    h: manhattanDistance(tile, goal),
+    f: fScore[tile] ?? null,
+    parent: cameFrom[tile]?.prev ?? null,
+    actionFromParent: cameFrom[tile]?.action ?? null,
+  }))
+}
+
+function snapshotAStarTree(
+  nodes: Map<number, InternalAStarTreeNode>,
+  bestTreeNodeByTile: Partial<Record<TileId, number>>,
+  openSet: Set<TileId>,
+  activeTreeNodeId: number | null,
+): AStarTreeNodeSnapshot[] {
+  return [...nodes.values()]
+    .map((node) => {
+      let status: AStarTreeNodeStatus = 'pruned'
+      if (node.id === activeTreeNodeId) {
+        status = 'active'
+      } else if (bestTreeNodeByTile[node.tile] === node.id && openSet.has(node.tile)) {
+        status = 'queued'
+      }
+
+      return {
+        id: node.id,
+        tile: node.tile,
+        parentId: node.parentId,
+        actionFromParent: node.actionFromParent,
+        depth: node.depth,
+        g: node.g,
+        h: node.h,
+        f: node.f,
+        status,
+      }
+    })
+    .sort((left, right) => left.id - right.id)
+}
+
+export function runAStarDemo(config: AStarConfig): AStarResult {
+  const { start, goal } = config
+  const deterministicAssumption =
+    'A* demo assumes deterministic transitions and ignores stuck-tile stochastic outcomes.'
+
+  const openSet = new Set<TileId>([start])
+  const closedSet = new Set<TileId>()
+  const cameFrom: Partial<Record<TileId, { prev: TileId; action: Action }>> = {}
+  const treeNodes = new Map<number, InternalAStarTreeNode>()
+
+  const gScore: Partial<Record<TileId, number>> = { [start]: 0 }
+  const fScore: Partial<Record<TileId, number>> = { [start]: manhattanDistance(start, goal) }
+  const rootTreeNode: InternalAStarTreeNode = {
+    id: 0,
+    tile: start,
+    parentId: null,
+    actionFromParent: null,
+    depth: 0,
+    g: 0,
+    h: manhattanDistance(start, goal),
+    f: manhattanDistance(start, goal),
+  }
+  treeNodes.set(rootTreeNode.id, rootTreeNode)
+  const bestTreeNodeByTile: Partial<Record<TileId, number>> = {
+    [start]: rootTreeNode.id,
+  }
+  let nextTreeNodeId = 1
+
+  const frames: AStarFrame[] = []
+  let step = 0
+  let reachedGoal = false
+  let finalPath: TileId[] = [start]
+  let finalActions: Action[] = []
+
+  const pushFrame = (payload: Omit<AStarFrame, 'kind' | 'step' | 'deterministicAssumption' | 'tree'>) => {
+    frames.push({
+      kind: 'astar',
+      step: step++,
+      deterministicAssumption,
+      tree: snapshotAStarTree(treeNodes, bestTreeNodeByTile, openSet, payload.activeTreeNodeId),
+      ...payload,
+    })
+  }
+
+  pushFrame({
+    phase: 'init',
+    message: `Initialized A* from ${start} to ${goal}.`,
+    current: start,
+    action: null,
+    neighbor: null,
+    openSet: [...openSet],
+    closedSet: [...closedSet],
+    pathPreview: [start],
+    reachedGoal: false,
+    scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+    activeTreeNodeId: rootTreeNode.id,
+    rejectedChild: null,
+  })
+
+  while (openSet.size > 0) {
+    const current = [...openSet].sort((left, right) => {
+      const fDiff = (fScore[left] ?? Number.POSITIVE_INFINITY) - (fScore[right] ?? Number.POSITIVE_INFINITY)
+      if (fDiff !== 0) {
+        return fDiff
+      }
+      return left.localeCompare(right)
+    })[0]
+    const currentTreeNodeId = bestTreeNodeByTile[current] ?? rootTreeNode.id
+
+    if (current === goal) {
+      reachedGoal = true
+      const reconstructed = reconstructPath(cameFrom, current)
+      finalPath = reconstructed.tiles
+      finalActions = reconstructed.actions
+
+      pushFrame({
+        phase: 'goal-found',
+        message: `Goal ${goal} reached. Final path contains ${finalPath.length - 1} moves.`,
+        current,
+        action: null,
+        neighbor: null,
+        openSet: [...openSet],
+        closedSet: [...closedSet],
+        pathPreview: finalPath,
+        reachedGoal: true,
+        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+        activeTreeNodeId: currentTreeNodeId,
+        rejectedChild: null,
+      })
+      break
+    }
+
+    openSet.delete(current)
+    closedSet.add(current)
+
+    const currentPath = reconstructPath(cameFrom, current).tiles
+    pushFrame({
+      phase: 'expand',
+      message: `Expanding ${current} from the frontier.`,
+      current,
+      action: null,
+      neighbor: null,
+      openSet: [...openSet],
+      closedSet: [...closedSet],
+      pathPreview: currentPath,
+      reachedGoal: false,
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      activeTreeNodeId: currentTreeNodeId,
+      rejectedChild: null,
+    })
+
+    for (const action of ACTIONS) {
+      const neighbor = deterministicTransition(current, action).destination
+      const tentativeG = (gScore[current] ?? Number.POSITIVE_INFINITY) + 1
+
+      pushFrame({
+        phase: 'consider-neighbor',
+        message: `Considering ${action} from ${current} to ${neighbor}.`,
+        current,
+        action,
+        neighbor,
+        openSet: [...openSet],
+        closedSet: [...closedSet],
+        pathPreview: currentPath,
+        reachedGoal: false,
+        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+        activeTreeNodeId: currentTreeNodeId,
+        rejectedChild: null,
+      })
+
+      if (closedSet.has(neighbor) && tentativeG >= (gScore[neighbor] ?? Number.POSITIVE_INFINITY)) {
+        pushFrame({
+          phase: 'skip-neighbor',
+          message: `Skipped ${neighbor} because no better score was found.`,
+          current,
+          action,
+          neighbor,
+          openSet: [...openSet],
+          closedSet: [...closedSet],
+          pathPreview: currentPath,
+          reachedGoal: false,
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          activeTreeNodeId: currentTreeNodeId,
+          rejectedChild: {
+            tile: neighbor,
+            parentTreeNodeId: currentTreeNodeId,
+            actionFromParent: action,
+            g: tentativeG,
+            h: manhattanDistance(neighbor, goal),
+            f: tentativeG + manhattanDistance(neighbor, goal),
+            reason: 'already-closed',
+          },
+        })
+        continue
+      }
+
+      if (tentativeG < (gScore[neighbor] ?? Number.POSITIVE_INFINITY)) {
+        cameFrom[neighbor] = { prev: current, action }
+        gScore[neighbor] = tentativeG
+        fScore[neighbor] = tentativeG + manhattanDistance(neighbor, goal)
+        const childTreeNode: InternalAStarTreeNode = {
+          id: nextTreeNodeId++,
+          tile: neighbor,
+          parentId: currentTreeNodeId,
+          actionFromParent: action,
+          depth: (treeNodes.get(currentTreeNodeId)?.depth ?? 0) + 1,
+          g: tentativeG,
+          h: manhattanDistance(neighbor, goal),
+          f: tentativeG + manhattanDistance(neighbor, goal),
+        }
+        treeNodes.set(childTreeNode.id, childTreeNode)
+        bestTreeNodeByTile[neighbor] = childTreeNode.id
+        openSet.add(neighbor)
+
+        const preview = reconstructPath(cameFrom, neighbor).tiles
+        pushFrame({
+          phase: 'update-neighbor',
+          message: `Updated ${neighbor}: g=${tentativeG}, f=${fScore[neighbor]}.`,
+          current,
+          action,
+          neighbor,
+          openSet: [...openSet],
+          closedSet: [...closedSet],
+          pathPreview: preview,
+          reachedGoal: false,
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          activeTreeNodeId: currentTreeNodeId,
+          rejectedChild: null,
+        })
+      } else {
+        pushFrame({
+          phase: 'skip-neighbor',
+          message: `Kept previous score for ${neighbor}.`,
+          current,
+          action,
+          neighbor,
+          openSet: [...openSet],
+          closedSet: [...closedSet],
+          pathPreview: currentPath,
+          reachedGoal: false,
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          activeTreeNodeId: currentTreeNodeId,
+          rejectedChild: {
+            tile: neighbor,
+            parentTreeNodeId: currentTreeNodeId,
+            actionFromParent: action,
+            g: tentativeG,
+            h: manhattanDistance(neighbor, goal),
+            f: tentativeG + manhattanDistance(neighbor, goal),
+            reason: 'not-better',
+          },
+        })
+      }
+    }
+  }
+
+  if (!reachedGoal) {
+    pushFrame({
+      phase: 'finished',
+      message: `A* ended without reaching ${goal}.`,
+      current: null,
+      action: null,
+      neighbor: null,
+      openSet: [...openSet],
+      closedSet: [...closedSet],
+      pathPreview: finalPath,
+      reachedGoal: false,
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      activeTreeNodeId: bestTreeNodeByTile[start] ?? rootTreeNode.id,
+      rejectedChild: null,
+    })
+  } else {
+    pushFrame({
+      phase: 'finished',
+      message: `A* finished with goal ${goal}.`,
+      current: goal,
+      action: null,
+      neighbor: null,
+      openSet: [...openSet],
+      closedSet: [...closedSet],
+      pathPreview: finalPath,
+      reachedGoal: true,
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      activeTreeNodeId: bestTreeNodeByTile[goal] ?? bestTreeNodeByTile[start] ?? rootTreeNode.id,
+      rejectedChild: null,
+    })
+  }
+
+  return {
+    frames,
+    path: finalPath,
+    actions: finalActions,
+    reachedGoal,
+  }
+}
+
+function snapshotTree(
+  nodes: Map<number, InternalMCTSNode>,
+  explorationConstant: number,
+): MCTSTreeNodeSnapshot[] {
+  return [...nodes.values()]
+    .map((node) => {
+      const parent = node.parentId === null ? null : nodes.get(node.parentId) ?? null
+      const parentVisits = parent ? Math.max(1, parent.visits) : null
+
+      return {
+        id: node.id,
+        tile: node.tile,
+        parentId: node.parentId,
+        actionFromParent: node.actionFromParent,
+        visits: node.visits,
+        valueSum: node.valueSum,
+        depth: node.depth,
+        parentVisits,
+        ucb: parentVisits === null ? null : getUctScore(node, parentVisits, explorationConstant),
+      }
+    })
+    .sort((left, right) => left.id - right.id)
+}
+
+function getUctScore(
+  child: InternalMCTSNode,
+  parentVisits: number,
+  explorationConstant: number,
+) {
+  if (child.visits === 0) {
+    return Number.POSITIVE_INFINITY
+  }
+
+  const exploitation = child.valueSum / child.visits
+  const exploration = explorationConstant * Math.sqrt(Math.log(Math.max(1, parentVisits)) / child.visits)
+  return exploitation + exploration
+}
+
+function rewardForTile(tile: TileId, goal: TileId) {
+  if (tile === goal) {
+    return 1
+  }
+  if (getTileType(tile) === 'T') {
+    return -1
+  }
+  return 0
+}
+
+function createRng(defaultRng?: () => number) {
+  if (defaultRng) {
+    return defaultRng
+  }
+
+  let state = 0x12345678
+  return () => {
+    state = (1664525 * state + 1013904223) >>> 0
+    return state / 0x100000000
+  }
+}
+
+export function runMCTSDemo(config: MCTSConfig): MCTSResult {
+  const { start, goal, explorationConstant, iterations, rolloutHorizon } = config
+  const rng = createRng(config.rng)
+
+  const frames: MCTSFrame[] = []
+  const nodes = new Map<number, InternalMCTSNode>()
+  const root: InternalMCTSNode = {
+    id: 0,
+    tile: start,
+    parentId: null,
+    actionFromParent: null,
+    depth: 0,
+    visits: 0,
+    valueSum: 0,
+    untriedActions: [...ACTIONS],
+    childrenByAction: {},
+  }
+  nodes.set(root.id, root)
+  let nextNodeId = 1
+  let step = 0
+
+  const getBestRootAction = () => {
+    let bestAction: Action | null = null
+    let bestVisits = -1
+
+    for (const action of ACTIONS) {
+      const childId = root.childrenByAction[action]
+      if (childId === undefined) {
+        continue
+      }
+      const child = nodes.get(childId)
+      if (!child) {
+        continue
+      }
+      if (child.visits > bestVisits) {
+        bestVisits = child.visits
+        bestAction = action
+      }
+    }
+
+    return {
+      action: bestAction,
+      visits: Math.max(0, bestVisits),
+    }
+  }
+
+  const pushFrame = (
+    payload: Omit<
+      MCTSFrame,
+      'kind' | 'step' | 'bestRootAction' | 'bestRootVisits' | 'tree' | 'explorationConstant'
+    >,
+  ) => {
+    const best = getBestRootAction()
+    frames.push({
+      kind: 'mcts',
+      step: step++,
+      explorationConstant,
+      bestRootAction: best.action,
+      bestRootVisits: best.visits,
+      tree: snapshotTree(nodes, explorationConstant),
+      ...payload,
+    })
+  }
+
+  pushFrame({
+    iteration: 0,
+    phase: 'init',
+    message: `Initialized MCTS at ${start} with c=${explorationConstant.toFixed(3)} and horizon=${rolloutHorizon}.`,
+    activeNodeId: root.id,
+    selectionPathIds: [root.id],
+    rolloutTiles: [start],
+  })
+
+  for (let iteration = 1; iteration <= iterations; iteration += 1) {
+    const selectionPath: number[] = [root.id]
+    let current = root
+
+    pushFrame({
+      iteration,
+      phase: 'selection',
+      message: `Iteration ${iteration}: starting selection at root.`,
+      activeNodeId: current.id,
+      selectionPathIds: [...selectionPath],
+      rolloutTiles: [current.tile],
+    })
+
+    while (current.untriedActions.length === 0) {
+      const childIds = ACTIONS.map((action) => current.childrenByAction[action]).filter(
+        (childId): childId is number => childId !== undefined,
+      )
+      if (childIds.length === 0) {
+        break
+      }
+
+      let bestChild: InternalMCTSNode | null = null
+      let bestScore = Number.NEGATIVE_INFINITY
+      for (const childId of childIds) {
+        const child = nodes.get(childId)
+        if (!child) {
+          continue
+        }
+        const score = getUctScore(child, Math.max(1, current.visits), explorationConstant)
+        if (score > bestScore) {
+          bestScore = score
+          bestChild = child
+        }
+      }
+
+      if (!bestChild) {
+        break
+      }
+
+      current = bestChild
+      selectionPath.push(current.id)
+      pushFrame({
+        iteration,
+        phase: 'selection',
+        message: `Selection moved to node ${current.id} (${current.tile}) via UCT.`,
+        activeNodeId: current.id,
+        selectionPathIds: [...selectionPath],
+        rolloutTiles: selectionPath.map((nodeId) => nodes.get(nodeId)?.tile ?? start),
+      })
+    }
+
+    if (current.untriedActions.length > 0) {
+      const actionIndex = Math.floor(rng() * current.untriedActions.length)
+      const [action] = current.untriedActions.splice(actionIndex, 1)
+      const nextState = sampleTransition(current.tile, action, rng).destination
+      const child: InternalMCTSNode = {
+        id: nextNodeId++,
+        tile: nextState,
+        parentId: current.id,
+        actionFromParent: action,
+        depth: current.depth + 1,
+        visits: 0,
+        valueSum: 0,
+        untriedActions: [...ACTIONS],
+        childrenByAction: {},
+      }
+      nodes.set(child.id, child)
+      current.childrenByAction[action] = child.id
+      current = child
+      selectionPath.push(current.id)
+
+      pushFrame({
+        iteration,
+        phase: 'expansion',
+        message: `Expanded action ${action} to node ${current.id} (${current.tile}).`,
+        activeNodeId: current.id,
+        selectionPathIds: [...selectionPath],
+        rolloutTiles: selectionPath.map((nodeId) => nodes.get(nodeId)?.tile ?? start),
+      })
+    }
+
+    const rolloutTiles: TileId[] = [current.tile]
+    let rolloutState = current.tile
+    const remainingSteps = Math.max(0, rolloutHorizon - current.depth)
+    for (let rolloutStep = 0; rolloutStep < remainingSteps; rolloutStep += 1) {
+      if (rolloutState === goal || getTileType(rolloutState) === 'T') {
+        break
+      }
+      const action = ACTIONS[Math.floor(rng() * ACTIONS.length)]
+      rolloutState = sampleTransition(rolloutState, action, rng).destination
+      rolloutTiles.push(rolloutState)
+    }
+
+    pushFrame({
+      iteration,
+      phase: 'rollout',
+      message: `Rollout visited ${rolloutTiles.length} state(s).`,
+      activeNodeId: current.id,
+      selectionPathIds: [...selectionPath],
+      rolloutTiles,
+    })
+
+    const reward = rewardForTile(rolloutState, goal)
+    for (let pathIndex = selectionPath.length - 1; pathIndex >= 0; pathIndex -= 1) {
+      const nodeId = selectionPath[pathIndex]
+      const node = nodes.get(nodeId)
+      if (!node) {
+        continue
+      }
+      node.visits += 1
+      node.valueSum += reward
+
+      pushFrame({
+        iteration,
+        phase: 'backprop',
+        message: `Backprop updated node ${node.id}: visits=${node.visits}, W=${node.valueSum.toFixed(2)}.`,
+        activeNodeId: node.id,
+        selectionPathIds: [...selectionPath],
+        rolloutTiles,
+      })
+    }
+
+    pushFrame({
+      iteration,
+      phase: 'iteration-end',
+      message: `Iteration ${iteration} complete.`,
+      activeNodeId: root.id,
+      selectionPathIds: [...selectionPath],
+      rolloutTiles,
+    })
+  }
+
+  const recommendedActions: Action[] = []
+  const recommendedPath: TileId[] = [start]
+  let cursor = root
+
+  for (let depth = 0; depth < rolloutHorizon; depth += 1) {
+    if (cursor.tile === goal || getTileType(cursor.tile) === 'T') {
+      break
+    }
+
+    let bestChild: InternalMCTSNode | null = null
+    let bestAction: Action | null = null
+    for (const action of ACTIONS) {
+      const childId = cursor.childrenByAction[action]
+      if (childId === undefined) {
+        continue
+      }
+      const child = nodes.get(childId)
+      if (!child) {
+        continue
+      }
+      if (!bestChild || child.visits > bestChild.visits) {
+        bestChild = child
+        bestAction = action
+      }
+    }
+
+    if (!bestChild || !bestAction) {
+      break
+    }
+
+    recommendedActions.push(bestAction)
+    recommendedPath.push(bestChild.tile)
+    cursor = bestChild
+  }
+
+  pushFrame({
+    iteration: iterations,
+    phase: 'finished',
+    message: `MCTS finished ${iterations} iterations.`,
+    activeNodeId: root.id,
+    selectionPathIds: [root.id],
+    rolloutTiles: recommendedPath,
+  })
+
+  return {
+    frames,
+    tree: snapshotTree(nodes, explorationConstant),
+    recommendedPath,
+    recommendedActions,
+  }
+}
