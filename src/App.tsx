@@ -17,6 +17,7 @@ import {
   COLUMNS,
   type Action,
   type TileId,
+  describeAction,
   getAllTiles,
   getRandomStartTile,
   getTileType,
@@ -555,11 +556,12 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
   })
 
   const edges: Edge[] = orderedTree.flatMap((node) => {
-    if (node.parentId === null) {
+    if (node.parentId === null || node.actionFromParent === null) {
       return []
     }
 
     const isActive = node.id === activeNodeId
+    const stroke = isActive ? '#2563eb' : '#9fb3d8'
     return [
       {
         id: `${node.parentId}-${node.id}`,
@@ -567,14 +569,27 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
         target: String(node.id),
         type: 'smoothstep',
         animated: isActive,
+        label: describeAction(node.actionFromParent),
+        labelStyle: {
+          fontSize: 10,
+          fontWeight: 700,
+          fill: stroke,
+        },
+        labelBgPadding: [6, 3],
+        labelBgBorderRadius: 10,
+        labelBgStyle: {
+          fill: '#ffffff',
+          fillOpacity: 0.92,
+          stroke: '#d9e1ee',
+        },
         markerEnd: {
           type: MarkerType.ArrowClosed,
           width: 18,
           height: 18,
-          color: isActive ? '#2563eb' : '#9fb3d8',
+          color: stroke,
         },
         style: {
-          stroke: isActive ? '#2563eb' : '#9fb3d8',
+          stroke,
           strokeWidth: isActive ? 2.8 : 2.2,
         },
       },
@@ -624,92 +639,132 @@ function buildAStarNavigationDiagram(frame: AStarFrame, goalTile: TileId) {
     marginy: 28,
   })
 
-  const renderTree: AStarRenderNodeSnapshot[] = frame.tree.map((node) => ({
-    id: String(node.id),
-    tile: node.tile,
-    parentId: node.parentId === null ? null : String(node.parentId),
-    actionFromParent: node.actionFromParent,
-    depth: node.depth,
-    g: node.g,
-    h: node.h,
-    f: node.f,
-    status: node.status,
-  }))
+  const treeNodeById = new Map(frame.tree.map((node) => [node.id, node] as const))
+  const nodeByTile = new Map<TileId, AStarTreeNodeSnapshot>(
+    frame.tree.map((node) => [node.tile, node] as const),
+  )
 
+  const uniqueTiles = new Set<TileId>(frame.tree.map((n) => n.tile))
   const rejectedChild = frame.rejectedChild
   if (rejectedChild) {
-    const currentNode = frame.tree.find((node) => node.id === rejectedChild.parentTreeNodeId)
-    renderTree.push({
-      id: `rejected-${frame.step}`,
-      tile: rejectedChild.tile,
-      parentId: String(rejectedChild.parentTreeNodeId),
-      actionFromParent: rejectedChild.actionFromParent,
-      depth: (currentNode?.depth ?? 0) + 1,
-      g: rejectedChild.g,
-      h: rejectedChild.h,
-      f: rejectedChild.f,
-      status: 'rejected',
-      rejectionReason: rejectedChild.reason,
-    })
+    uniqueTiles.add(rejectedChild.tile)
   }
 
-  const orderedTree = renderTree.sort((left, right) => {
-    const depthDiff = left.depth - right.depth
-    if (depthDiff !== 0) {
-      return depthDiff
+  const renderNodeByTile = new Map<TileId, AStarRenderNodeSnapshot>()
+  for (const tile of uniqueTiles) {
+    const accepted = nodeByTile.get(tile)
+    const parentNode = accepted ? (accepted.parentId !== null ? treeNodeById.get(accepted.parentId) : null) : null
+    const parentTile = parentNode?.tile ?? null
+    if (accepted) {
+      renderNodeByTile.set(tile, {
+        id: tile,
+        tile,
+        parentId: parentTile,
+        actionFromParent: accepted.actionFromParent,
+        depth: accepted.depth,
+        g: accepted.g,
+        h: accepted.h,
+        f: accepted.f,
+        status: accepted.status,
+      })
+    } else if (rejectedChild && rejectedChild.tile === tile) {
+      const parentNodeForRejected = treeNodeById.get(rejectedChild.parentTreeNodeId)
+      const parentTileForRejected = parentNodeForRejected?.tile ?? null
+      renderNodeByTile.set(tile, {
+        id: tile,
+        tile,
+        parentId: parentTileForRejected,
+        actionFromParent: rejectedChild.actionFromParent,
+        depth: (parentNodeForRejected?.depth ?? 0) + 1,
+        g: rejectedChild.g,
+        h: rejectedChild.h,
+        f: rejectedChild.f,
+        status: 'rejected',
+        rejectionReason: rejectedChild.reason,
+      })
     }
+  }
 
-    const leftParent = left.parentId ?? ''
-    const rightParent = right.parentId ?? ''
-    if (leftParent !== rightParent) {
-      return leftParent.localeCompare(rightParent)
-    }
-
-    const fDiff = left.f - right.f
-    if (fDiff !== 0) {
-      return fDiff
-    }
-
-    return left.id.localeCompare(right.id)
+  const orderedTiles = [...uniqueTiles].sort((a, b) => {
+    const nodeA = renderNodeByTile.get(a)
+    const nodeB = renderNodeByTile.get(b)
+    if (!nodeA || !nodeB) return 0
+    const depthDiff = nodeA.depth - nodeB.depth
+    if (depthDiff !== 0) return depthDiff
+    const parentDiff = (nodeA.parentId ?? '').localeCompare(nodeB.parentId ?? '')
+    if (parentDiff !== 0) return parentDiff
+    const fDiff = nodeA.f - nodeB.f
+    if (fDiff !== 0) return fDiff
+    return a.localeCompare(b)
   })
 
-  for (const node of orderedTree) {
-    graph.setNode(node.id, {
+  for (const tile of orderedTiles) {
+    graph.setNode(tile, {
       width: SEARCH_NODE_WIDTH,
       height: SEARCH_NODE_HEIGHT,
     })
   }
 
-  for (const node of orderedTree) {
-    if (node.parentId !== null) {
-      graph.setEdge(node.parentId, node.id)
+  type EdgeKey = { parentTile: TileId; childTile: TileId; action: Action; status: 'accepted' | 'rejected' }
+  const edgesToAdd: EdgeKey[] = []
+  for (const node of frame.tree) {
+    if (node.parentId === null || node.actionFromParent === null) continue
+    const parentNode = treeNodeById.get(node.parentId)
+    if (!parentNode) continue
+    edgesToAdd.push({
+      parentTile: parentNode.tile,
+      childTile: node.tile,
+      action: node.actionFromParent,
+      status: 'accepted',
+    })
+  }
+  if (rejectedChild) {
+    const parentNode = treeNodeById.get(rejectedChild.parentTreeNodeId)
+    if (parentNode) {
+      edgesToAdd.push({
+        parentTile: parentNode.tile,
+        childTile: rejectedChild.tile,
+        action: rejectedChild.actionFromParent,
+        status: 'rejected',
+      })
     }
+  }
+
+  for (const { parentTile, childTile } of edgesToAdd) {
+    graph.setEdge(parentTile, childTile)
   }
 
   dagre.layout(graph)
-  const nodeById = new Map(orderedTree.map((node) => [node.id, node] as const))
-  const activePathEdgeSet = new Set<string>()
-  let pathCursorId = frame.activeTreeNodeId === null ? null : String(frame.activeTreeNodeId)
+  const nodeById = new Map(orderedTiles.map((tile) => [tile, renderNodeByTile.get(tile)!] as const))
 
+  const activePathEdgeSet = new Set<string>()
+  let pathCursorId: number | null = frame.activeTreeNodeId
+  const activeTiles: TileId[] = []
   while (pathCursorId !== null) {
-    const node = nodeById.get(pathCursorId)
-    if (!node || node.parentId === null) {
-      break
-    }
-    activePathEdgeSet.add(`${node.parentId}-${node.id}`)
+    const node = treeNodeById.get(pathCursorId)
+    if (!node) break
+    activeTiles.unshift(node.tile)
     pathCursorId = node.parentId
   }
+  for (let i = 0; i < activeTiles.length - 1; i++) {
+    const parentTile = activeTiles[i]
+    const childTile = activeTiles[i + 1]
+    const edge = edgesToAdd.find((e) => e.parentTile === parentTile && e.childTile === childTile && e.status === 'accepted')
+    if (edge) {
+      activePathEdgeSet.add(`${parentTile}-${childTile}-${edge.action}-accepted`)
+    }
+  }
 
-  const nodes: SearchFlowNodeType[] = orderedTree.map((node) => {
-    const position = graph.node(node.id)
-
+  const nodes: SearchFlowNodeType[] = orderedTiles.map((tile) => {
+    const snapshot = renderNodeByTile.get(tile)!
+    const position = graph.node(tile)
     return {
-      id: node.id,
+      id: tile,
       type: 'searchNode',
       data: {
         mode: 'astar',
-        snapshot: node,
-        previewPath: buildAStarTreePath(node.id, nodeById),
+        snapshot,
+        previewPath: buildAStarTreePath(tile, nodeById),
         goalTile,
       },
       draggable: false,
@@ -725,55 +780,50 @@ function buildAStarNavigationDiagram(frame: AStarFrame, goalTile: TileId) {
     }
   })
 
-  const edges: Edge[] = orderedTree.flatMap((node) => {
-    if (node.parentId === null) {
-      return []
-    }
-
-    const edgeId = `${node.parentId}-${node.id}`
-    const isActivePath = activePathEdgeSet.has(edgeId)
+  const edges: Edge[] = edgesToAdd.map(({ parentTile, childTile, action, status }) => {
+    const edgeId = `${parentTile}-${childTile}-${action}-${status}`
+    const isActivePath = status === 'accepted' && activePathEdgeSet.has(edgeId)
+    const snapshot = renderNodeByTile.get(childTile)!
     const stroke =
-      node.status === 'rejected'
+      status === 'rejected'
         ? '#dc2626'
-        : node.status === 'active' || isActivePath
-        ? '#2563eb'
-        : node.status === 'queued'
-          ? '#d97706'
-          : '#94a3b8'
+        : snapshot.status === 'active' || isActivePath
+          ? '#2563eb'
+          : snapshot.status === 'queued'
+            ? '#d97706'
+            : '#94a3b8'
 
-    return [
-      {
-        id: edgeId,
-        source: String(node.parentId),
-        target: String(node.id),
-        type: 'smoothstep',
-        animated: node.status === 'active' || node.status === 'rejected',
-        label: node.actionFromParent ?? '',
-        labelStyle: {
-          fontSize: 10,
-          fontWeight: 700,
-          fill: stroke,
-        },
-        labelBgPadding: [6, 3],
-        labelBgBorderRadius: 10,
-        labelBgStyle: {
-          fill: '#ffffff',
-          fillOpacity: 0.92,
-          stroke: '#d9e1ee',
-        },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          width: 18,
-          height: 18,
-          color: stroke,
-        },
-        style: {
-          stroke,
-          strokeDasharray: node.status === 'rejected' ? '6 4' : undefined,
-          strokeWidth: node.status === 'rejected' ? 2.2 : isActivePath ? 2.6 : 2,
-        },
+    return {
+      id: edgeId,
+      source: parentTile,
+      target: childTile,
+      type: 'smoothstep',
+      animated: snapshot.status === 'active' || status === 'rejected',
+      label: describeAction(action),
+      labelStyle: {
+        fontSize: 10,
+        fontWeight: 700,
+        fill: stroke,
       },
-    ]
+      labelBgPadding: [6, 3],
+      labelBgBorderRadius: 10,
+      labelBgStyle: {
+        fill: '#ffffff',
+        fillOpacity: 0.92,
+        stroke: '#d9e1ee',
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        width: 18,
+        height: 18,
+        color: stroke,
+      },
+      style: {
+        stroke,
+        strokeDasharray: status === 'rejected' ? '6 4' : undefined,
+        strokeWidth: status === 'rejected' ? 2.2 : isActivePath ? 2.6 : 2,
+      },
+    }
   })
 
   return { nodes, edges }
@@ -1489,8 +1539,9 @@ function App() {
               <div className="section-heading">
                 <h2>A* Navigation Graph</h2>
                 <p>
-                  This tree grows as A* discovers better states, with each new node added as a leaf
-                  beneath the active state that generated it.
+                  One node per state; edges are actions and show the action label. The graph grows as
+                  A* discovers states, with each new node added as a leaf beneath the state that
+                  generated it.
                 </p>
               </div>
               <div className="mcts-tree-summary">
@@ -1584,7 +1635,8 @@ function App() {
                 <h2>MCTS Tree View</h2>
                 <p>
                   The full search tree is laid out by depth, with the active node highlighted and
-                  enough spacing to make rollout structure easier to scan.
+                  enough spacing to make rollout structure easier to scan. Nodes are states (board
+                  positions); edges are actions and are labeled with the action taken.
                 </p>
               </div>
               <div className="mcts-tree-summary">
