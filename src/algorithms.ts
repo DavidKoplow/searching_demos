@@ -131,6 +131,8 @@ type MCTSConfig = {
   explorationConstant: number
   gamma: number
   rolloutHorizon: number
+  goalReward?: number
+  trapReward?: number
   rng?: () => number
 }
 
@@ -529,18 +531,30 @@ function getUctScore(
   return exploitation + exploration
 }
 
-function rewardForTile(tile: TileId, goal: TileId) {
+function rewardForTile(
+  tile: TileId,
+  goal: TileId,
+  goalReward: number = 10,
+  trapReward: number = -1,
+) {
   if (tile === goal) {
-    return 1
+    return goalReward
   }
   if (getTileType(tile) === 'T') {
-    return -1
+    return trapReward
   }
   return 0
 }
 
-function discountedRewardForTile(tile: TileId, goal: TileId, stepsAhead: number, gamma: number) {
-  const baseReward = rewardForTile(tile, goal)
+function discountedRewardForTile(
+  tile: TileId,
+  goal: TileId,
+  stepsAhead: number,
+  gamma: number,
+  goalReward: number = 10,
+  trapReward: number = -1,
+) {
+  const baseReward = rewardForTile(tile, goal, goalReward, trapReward)
   if (baseReward === 0) {
     return 0
   }
@@ -561,7 +575,16 @@ function createRng(defaultRng?: () => number) {
 }
 
 export function runMCTSDemo(config: MCTSConfig): MCTSResult {
-  const { start, goal, explorationConstant, gamma, iterations, rolloutHorizon } = config
+  const {
+    start,
+    goal,
+    explorationConstant,
+    gamma,
+    iterations,
+    rolloutHorizon,
+    goalReward = 10,
+    trapReward = -1,
+  } = config
   const rng = createRng(config.rng)
 
   const frames: MCTSFrame[] = []
@@ -736,7 +759,14 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       rolloutTiles,
     })
 
-    let reward = discountedRewardForTile(rolloutState, goal, rolloutTiles.length - 1, gamma)
+    let reward = discountedRewardForTile(
+      rolloutState,
+      goal,
+      rolloutTiles.length - 1,
+      gamma,
+      goalReward,
+      trapReward,
+    )
     for (let pathIndex = selectionPath.length - 1; pathIndex >= 0; pathIndex -= 1) {
       const nodeId = selectionPath[pathIndex]
       const node = nodes.get(nodeId)

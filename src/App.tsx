@@ -880,6 +880,8 @@ function App() {
   const [mctsExplorationC, setMctsExplorationC] = useState(Math.SQRT2)
   const [mctsGamma, setMctsGamma] = useState(0.9)
   const [mctsHorizon, setMctsHorizon] = useState(100)
+  const [mctsGoalReward, setMctsGoalReward] = useState(10)
+  const [mctsTrapReward, setMctsTrapReward] = useState(-1)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
   const tokenAnimationCounterRef = useRef(0)
   const tokenAnimationTimerRef = useRef<number | null>(null)
@@ -1092,6 +1094,8 @@ function App() {
       explorationConstant: mctsExplorationC,
       gamma: mctsGamma,
       rolloutHorizon: mctsHorizon,
+      goalReward: mctsGoalReward,
+      trapReward: mctsTrapReward,
     })
     const executionFrames = buildExecutionFrames(result.recommendedPath, result.recommendedActions).map(
       (frame, index) => ({
@@ -1101,7 +1105,18 @@ function App() {
     )
     setDemoFrames([...result.frames, ...executionFrames])
     setDemoIndex(0)
-  }, [algorithm, clearTokenAnimation, currentTile, goalTile, mctsExplorationC, mctsGamma, mctsHorizon, mctsIterations])
+  }, [
+    algorithm,
+    clearTokenAnimation,
+    currentTile,
+    goalTile,
+    mctsExplorationC,
+    mctsGamma,
+    mctsGoalReward,
+    mctsHorizon,
+    mctsIterations,
+    mctsTrapReward,
+  ])
 
   useEffect(() => {
     if (!isAutoPlay || demoFrames.length === 0) {
@@ -1433,6 +1448,22 @@ function App() {
                     onChange={(event) =>
                       setMctsGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
                     }
+                  />
+                </label>
+                <label>
+                  Goal reward
+                  <input
+                    type="number"
+                    value={mctsGoalReward}
+                    onChange={(event) => setMctsGoalReward(Number(event.target.value) || 0)}
+                  />
+                </label>
+                <label>
+                  Trap reward
+                  <input
+                    type="number"
+                    value={mctsTrapReward}
+                    onChange={(event) => setMctsTrapReward(Number(event.target.value) || 0)}
                   />
                 </label>
               </div>
