@@ -627,7 +627,11 @@ function formatAStarScore(value: number | null) {
 }
 
 function formatHeuristicValue(value: number) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/\.?0+$/, '')
+  return formatGraphNumber(value)
+}
+
+function formatInputNumber(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
 }
 
 function formatAdmissibilityViolation(violation: AStarAdmissibilityViolation) {
@@ -688,7 +692,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
       />
       <div className="tree-node-stats">
         <span>g={formatAStarScore(data.snapshot.g)}</span>
-        <span>h={data.snapshot.h}</span>
+        <span>h={formatGraphNumber(data.snapshot.h)}</span>
         <span>f={formatAStarScore(data.snapshot.f)}</span>
         <span>{data.snapshot.status}</span>
       </div>
@@ -1148,7 +1152,7 @@ function formatAStarScorePreview(frame: AStarFrame) {
     .filter((row) => row.f !== null)
     .sort((left, right) => (left.f ?? Number.POSITIVE_INFINITY) - (right.f ?? Number.POSITIVE_INFINITY))
     .slice(0, 4)
-    .map((row) => `${row.tile}(g=${row.g}, h=${row.h}, f=${row.f})`)
+    .map((row) => `${row.tile}(g=${formatAStarScore(row.g)}, h=${formatGraphNumber(row.h)}, f=${formatAStarScore(row.f)})`)
 
   return visibleRows.length > 0 ? visibleRows.join(' | ') : '(none yet)'
 }
@@ -1814,7 +1818,7 @@ function App() {
             <li>
               <strong>Goal</strong>: reaching the goal tile is absorbing (you win and stay).
             </li>
-            <li>Wall hits: stay in place. Observe only current tile type: N, S, or T.</li>
+            <li>Wall hits: stay in place.</li>
           </ul>
         </section>
 
@@ -1867,7 +1871,7 @@ function App() {
                       <span className="cell-id">{tileId}</span>
                       {scoreRow && (scoreRow.g !== null || scoreRow.f !== null) && (
                         <span className="cell-score">
-                          g:{scoreRow.g ?? '-'} h:{scoreRow.h} f:{scoreRow.f ?? '-'}
+                          g:{formatAStarScore(scoreRow.g)} h:{formatGraphNumber(scoreRow.h)} f:{formatAStarScore(scoreRow.f)}
                         </span>
                       )}
                     </div>
@@ -2106,7 +2110,7 @@ function App() {
                   type="number"
                   min="0"
                   step="0.1"
-                  value={mctsExplorationC}
+                  value={formatInputNumber(mctsExplorationC)}
                   onChange={(event) => setMctsExplorationC(Number(event.target.value) || 0)}
                 />
               </label>
@@ -2137,7 +2141,7 @@ function App() {
                   min="0"
                   max="1"
                   step="0.05"
-                  value={mctsGamma}
+                  value={formatInputNumber(mctsGamma)}
                   onChange={(event) =>
                     setMctsGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
                   }
@@ -2147,7 +2151,7 @@ function App() {
                 Goal reward
                 <input
                   type="number"
-                  value={mctsGoalReward}
+                  value={formatInputNumber(mctsGoalReward)}
                   onChange={(event) => setMctsGoalReward(Number(event.target.value) || 0)}
                 />
               </label>
@@ -2155,7 +2159,7 @@ function App() {
                 Trap reward
                 <input
                   type="number"
-                  value={mctsTrapReward}
+                  value={formatInputNumber(mctsTrapReward)}
                   onChange={(event) => setMctsTrapReward(Number(event.target.value) || 0)}
                 />
               </label>
