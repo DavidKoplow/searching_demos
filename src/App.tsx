@@ -33,6 +33,12 @@ import {
   type MCTSFrame,
   type MCTSTreeNodeSnapshot,
 } from './algorithms'
+import {
+  DEFAULT_ASTAR_HEURISTIC_EXPRESSION,
+  analyzeAStarHeuristic,
+  type AStarAdmissibilityViolation,
+  type AStarConsistencyViolation,
+} from './astarHeuristic'
 
 type ExecutionFrame = {
   kind: 'execution'
@@ -618,6 +624,19 @@ function formatGraphNumber(value: number) {
 
 function formatAStarScore(value: number | null) {
   return value === null ? '-' : formatGraphNumber(value)
+}
+
+function formatHeuristicValue(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/\.?0+$/, '')
+}
+
+function formatAdmissibilityViolation(violation: AStarAdmissibilityViolation) {
+  return `${violation.tile}: h=${formatHeuristicValue(violation.heuristic)} but the exact cost to the goal is ${formatHeuristicValue(violation.trueCost)}.`
+}
+
+function formatConsistencyViolation(violation: AStarConsistencyViolation) {
+  const rightHandSide = violation.stepCost + violation.neighborHeuristic
+  return `${violation.tile} --${violation.action}--> ${violation.neighbor}: h=${formatHeuristicValue(violation.heuristic)} but c+h'=${formatHeuristicValue(rightHandSide)} (step cost ${formatHeuristicValue(violation.stepCost)}, neighbor h ${formatHeuristicValue(violation.neighborHeuristic)}).`
 }
 
 function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
@@ -1355,6 +1374,9 @@ function App() {
   const [currentTile, setCurrentTile] = useState<TileId>(() => getRandomStartTile())
   const [algorithm, setAlgorithm] = useState<AlgorithmKind>('astar')
   const [goalTile, setGoalTile] = useState<TileId>('2F')
+  const [astarHeuristicExpression, setAStarHeuristicExpression] = useState(
+    DEFAULT_ASTAR_HEURISTIC_EXPRESSION,
+  )
   const [demoFrames, setDemoFrames] = useState<DemoFrame[]>([])
   const [demoIndex, setDemoIndex] = useState(0)
   const [isAutoPlay, setIsAutoPlay] = useState(false)
@@ -1372,6 +1394,10 @@ function App() {
   const tokenAnimationTimerRef = useRef<number | null>(null)
 
   const allTiles = useMemo(() => getAllTiles(), [])
+  const astarHeuristicAnalysis = useMemo(
+    () => analyzeAStarHeuristic(astarHeuristicExpression, goalTile),
+    [astarHeuristicExpression, goalTile],
+  )
   const activeFrame = demoFrames[demoIndex] ?? null
   const latestSearchFrame = useMemo(
     () => getLatestSearchFrame(demoFrames, demoIndex),
@@ -1615,7 +1641,16 @@ function App() {
     clearTokenAnimation()
     setIsAutoPlay(true)
     if (algorithm === 'astar') {
-      const result = runAStarDemo({ start: currentTile, goal: goalTile })
+      if (astarHeuristicAnalysis.error) {
+        setIsAutoPlay(false)
+        return
+      }
+
+      const result = runAStarDemo({
+        start: currentTile,
+        goal: goalTile,
+        heuristicExpression: astarHeuristicExpression,
+      })
       const executionFrames = buildExecutionFrames(result.path, result.actions).map((frame, index) => ({
         ...frame,
         step: result.frames.length + index,
@@ -1703,6 +1738,8 @@ function App() {
     clearTokenAnimation,
     currentTile,
     goalTile,
+    astarHeuristicAnalysis.error,
+    astarHeuristicExpression,
     mctsExplorationC,
     mctsGamma,
     mctsGoalReward,
@@ -1772,7 +1809,7 @@ function App() {
             <li>3×6 grid (rows 1–3, columns A–F). Start on a random tile.</li>
             <li>Each step: choose up, down, left, or right.</li>
             <li>
-              <strong>N</strong>: move as chosen. <strong>S</strong>: 50% stay, else move. <strong>T</strong>: absorbing (never leave).
+              <strong>White</strong>: move as chosen. <strong>Blue</strong>: 50% stay, else move. <strong>Red/Green</strong>: absorbing (never leave).
             </li>
             <li>
               <strong>Goal</strong>: reaching the goal tile is absorbing (you win and stay).
@@ -1789,16 +1826,17 @@ function App() {
             </p>
           </div>
 
-          <div
-            className="board-grid"
-            style={
-              {
-                '--board-columns': COLUMNS.length,
-                '--board-rows': BOARD_ROWS.length,
-              } as CSSProperties
-            }
-            aria-label="Dungeon board"
-          >
+          <div className="board-grid-shell">
+            <div
+              className="board-grid"
+              style={
+                {
+                  '--board-columns': COLUMNS.length,
+                  '--board-rows': BOARD_ROWS.length,
+                } as CSSProperties
+              }
+              aria-label="Dungeon board"
+            >
             <div className="corner-label" />
             {COLUMNS.map((column: (typeof COLUMNS)[number]) => (
               <div className="axis-label column-label" key={column}>
@@ -1813,7 +1851,6 @@ function App() {
                 </div>
                 {COLUMNS.map((column: (typeof COLUMNS)[number]) => {
                   const tileId = `${row}${column}` as TileId
-                  const tileType = getTileType(tileId)
                   const isCurrent = tileId === visibleTile
                   const isGoal = tileId === goalTile
                   const isOpen = astarOpenSet?.has(tileId) ?? false
@@ -1839,8 +1876,8 @@ function App() {
               </Fragment>
             ))}
 
-            <div className="board-overlay" aria-hidden="true">
-              <svg className="board-visual-layer" viewBox={`0 0 ${COLUMNS.length} ${BOARD_ROWS.length}`}>
+              <div className="board-overlay" aria-hidden="true">
+                <svg className="board-visual-layer" viewBox={`0 0 ${COLUMNS.length} ${BOARD_ROWS.length}`}>
                 {isAStarFrame(activeFrame) &&
                   Array.from(astarClosedSet ?? []).map((tile) => {
                     const point = getBoardPoint(tile)
@@ -1926,12 +1963,13 @@ function App() {
                       />
                     )
                   })}
-              </svg>
-              <span
-                key={renderedTokenAnimation?.key ?? `rest-${visibleTile}`}
-                className={`board-avatar ${boardAvatarClassName}`}
-                style={boardAvatarStyle}
-              />
+                </svg>
+                <span
+                  key={renderedTokenAnimation?.key ?? `rest-${visibleTile}`}
+                  className={`board-avatar ${boardAvatarClassName}`}
+                  style={boardAvatarStyle}
+                />
+              </div>
             </div>
           </div>
 
@@ -1990,6 +2028,75 @@ function App() {
               </select>
             </label>
           </div>
+
+          {algorithm === 'astar' && (
+            <div className="heuristic-panel">
+              <label className="heuristic-editor">
+                Heuristic expression
+                <textarea
+                  className={`heuristic-input ${astarHeuristicAnalysis.error ? 'heuristic-input-invalid' : ''}`}
+                  value={astarHeuristicExpression}
+                  onChange={(event) => setAStarHeuristicExpression(event.target.value)}
+                  rows={3}
+                  spellCheck={false}
+                />
+              </label>
+              <p className="heuristic-hint">
+                Use <code>x1</code>, <code>y1</code>, <code>x2</code>, <code>y2</code> with{' '}
+                <code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>**</code>, and parentheses.
+              </p>
+              <div className="heuristic-status-row">
+                <span
+                  className={`heuristic-status-tag ${
+                    astarHeuristicAnalysis.admissible ? 'heuristic-status-tag-true' : 'heuristic-status-tag-false'
+                  }`}
+                >
+                  Admissible: {astarHeuristicAnalysis.admissible ? 'True' : 'False'}
+                </span>
+                <span
+                  className={`heuristic-status-tag ${
+                    astarHeuristicAnalysis.consistent ? 'heuristic-status-tag-true' : 'heuristic-status-tag-false'
+                  }`}
+                >
+                  Consistent: {astarHeuristicAnalysis.consistent ? 'True' : 'False'}
+                </span>
+              </div>
+              {astarHeuristicAnalysis.error ? (
+                <p className="heuristic-error">{astarHeuristicAnalysis.error}</p>
+              ) : (
+                (astarHeuristicAnalysis.admissible === false || astarHeuristicAnalysis.consistent === false) && (
+                  <div className="heuristic-counterexample-grid">
+                    {astarHeuristicAnalysis.admissible === false &&
+                      astarHeuristicAnalysis.admissibilityViolations.length > 0 && (
+                        <div className="heuristic-counterexample-card">
+                          <h3>Not admissible</h3>
+                          <ul className="heuristic-counterexample-list">
+                            {astarHeuristicAnalysis.admissibilityViolations.map((violation) => (
+                              <li key={`admissible-${violation.tile}`}>
+                                {formatAdmissibilityViolation(violation)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    {astarHeuristicAnalysis.consistent === false &&
+                      astarHeuristicAnalysis.consistencyViolations.length > 0 && (
+                        <div className="heuristic-counterexample-card">
+                          <h3>Not consistent</h3>
+                          <ul className="heuristic-counterexample-list">
+                            {astarHeuristicAnalysis.consistencyViolations.map((violation) => (
+                              <li key={`consistent-${violation.tile}-${violation.action}-${violation.neighbor}`}>
+                                {formatConsistencyViolation(violation)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                  </div>
+                )
+              )}
+            </div>
+          )}
 
           {algorithm === 'mcts' && (
             <div className="control-grid">
@@ -2056,7 +2163,12 @@ function App() {
           )}
 
           <div className="control-row">
-            <button className="primary-button" type="button" onClick={runAlgorithm}>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={runAlgorithm}
+              disabled={algorithm === 'astar' && astarHeuristicAnalysis.error !== null}
+            >
               Start
             </button>
             <button

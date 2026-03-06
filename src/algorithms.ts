@@ -8,6 +8,11 @@ import {
   type Action,
   type TileId,
 } from './game'
+import {
+  DEFAULT_ASTAR_HEURISTIC_EXPRESSION,
+  getAStarHeuristicDefinition,
+  type AStarHeuristicAnalysis,
+} from './astarHeuristic'
 
 export type AlgorithmKind = 'astar' | 'mcts'
 
@@ -61,6 +66,7 @@ export type AStarResult = {
   path: TileId[]
   actions: Action[]
   reachedGoal: boolean
+  heuristicAnalysis: AStarHeuristicAnalysis
 }
 
 export type MCTSFramePhase =
@@ -131,6 +137,7 @@ export type MCTSResult = {
 type AStarConfig = {
   start: TileId
   goal: TileId
+  heuristicExpression?: string
 }
 
 type MCTSConfig = {
@@ -169,19 +176,6 @@ type InternalAStarTreeNode = {
   f: number
 }
 
-function parseTile(tile: TileId) {
-  const [row, column] = [...tile] as [`${1 | 2 | 3}`, string]
-  return { row: Number(row), column }
-}
-
-function manhattanDistance(source: TileId, target: TileId) {
-  const sourceParsed = parseTile(source)
-  const targetParsed = parseTile(target)
-  const sourceColumn = sourceParsed.column.charCodeAt(0) - 65
-  const targetColumn = targetParsed.column.charCodeAt(0) - 65
-  return Math.abs(sourceParsed.row - targetParsed.row) + Math.abs(sourceColumn - targetColumn)
-}
-
 function reconstructPath(cameFrom: Partial<Record<TileId, { prev: TileId; action: Action }>>, end: TileId) {
   const tiles: TileId[] = [end]
   const actions: Action[] = []
@@ -205,11 +199,12 @@ function makeScoreRows(
   fScore: Partial<Record<TileId, number>>,
   cameFrom: Partial<Record<TileId, { prev: TileId; action: Action }>>,
   goal: TileId,
+  heuristic: (source: TileId, target: TileId) => number,
 ) {
   return getAllTiles().map((tile) => ({
     tile,
     g: gScore[tile] ?? null,
-    h: manhattanDistance(tile, goal),
+    h: heuristic(tile, goal),
     f: fScore[tile] ?? null,
     parent: cameFrom[tile]?.prev ?? null,
     actionFromParent: cameFrom[tile]?.action ?? null,
@@ -250,6 +245,11 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
   const { start, goal } = config
   const deterministicAssumption =
     'A* uses expected turn cost for each action outcome; leaving a stuck tile in a successful direction costs 2 expected turns.'
+  const heuristicDefinition = getAStarHeuristicDefinition(
+    config.heuristicExpression ?? DEFAULT_ASTAR_HEURISTIC_EXPRESSION,
+    goal,
+  )
+  const heuristic = heuristicDefinition.evaluator
 
   const openSet = new Set<TileId>([start])
   const closedSet = new Set<TileId>()
@@ -257,7 +257,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
   const treeNodes = new Map<number, InternalAStarTreeNode>()
 
   const gScore: Partial<Record<TileId, number>> = { [start]: 0 }
-  const fScore: Partial<Record<TileId, number>> = { [start]: manhattanDistance(start, goal) }
+  const fScore: Partial<Record<TileId, number>> = { [start]: heuristic(start, goal) }
   const rootTreeNode: InternalAStarTreeNode = {
     id: 0,
     tile: start,
@@ -265,8 +265,8 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
     actionFromParent: null,
     depth: 0,
     g: 0,
-    h: manhattanDistance(start, goal),
-    f: manhattanDistance(start, goal),
+    h: heuristic(start, goal),
+    f: heuristic(start, goal),
   }
   treeNodes.set(rootTreeNode.id, rootTreeNode)
   const bestTreeNodeByTile: Partial<Record<TileId, number>> = {
@@ -300,7 +300,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
     closedSet: [...closedSet],
     pathPreview: [start],
     reachedGoal: false,
-    scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+    scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
     activeTreeNodeId: rootTreeNode.id,
     rejectedChild: null,
   })
@@ -316,7 +316,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
       closedSet: [...closedSet],
       pathPreview: finalPath,
       reachedGoal: false,
-      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
       activeTreeNodeId: null,
       rejectedChild: null,
     })
@@ -345,7 +345,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
         closedSet: [...closedSet],
         pathPreview: finalPath,
         reachedGoal: true,
-        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
         activeTreeNodeId: currentTreeNodeId,
         rejectedChild: null,
       })
@@ -366,7 +366,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
       closedSet: [...closedSet],
       pathPreview: currentPath,
       reachedGoal: false,
-      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
       activeTreeNodeId: currentTreeNodeId,
       rejectedChild: null,
     })
@@ -386,7 +386,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
         closedSet: [...closedSet],
         pathPreview: currentPath,
         reachedGoal: false,
-        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+        scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
         activeTreeNodeId: currentTreeNodeId,
         rejectedChild: null,
       })
@@ -402,15 +402,15 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
           closedSet: [...closedSet],
           pathPreview: currentPath,
           reachedGoal: false,
-          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
           activeTreeNodeId: currentTreeNodeId,
           rejectedChild: {
             tile: neighbor,
             parentTreeNodeId: currentTreeNodeId,
             actionFromParent: action,
             g: tentativeG,
-            h: manhattanDistance(neighbor, goal),
-            f: tentativeG + manhattanDistance(neighbor, goal),
+            h: heuristic(neighbor, goal),
+            f: tentativeG + heuristic(neighbor, goal),
             reason: 'already-closed',
           },
         })
@@ -420,7 +420,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
       if (tentativeG < (gScore[neighbor] ?? Number.POSITIVE_INFINITY)) {
         cameFrom[neighbor] = { prev: current, action }
         gScore[neighbor] = tentativeG
-        fScore[neighbor] = tentativeG + manhattanDistance(neighbor, goal)
+        fScore[neighbor] = tentativeG + heuristic(neighbor, goal)
         const childTreeNode: InternalAStarTreeNode = {
           id: nextTreeNodeId++,
           tile: neighbor,
@@ -428,8 +428,8 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
           actionFromParent: action,
           depth: (treeNodes.get(currentTreeNodeId)?.depth ?? 0) + 1,
           g: tentativeG,
-          h: manhattanDistance(neighbor, goal),
-          f: tentativeG + manhattanDistance(neighbor, goal),
+          h: heuristic(neighbor, goal),
+          f: tentativeG + heuristic(neighbor, goal),
         }
         treeNodes.set(childTreeNode.id, childTreeNode)
         bestTreeNodeByTile[neighbor] = childTreeNode.id
@@ -446,7 +446,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
           closedSet: [...closedSet],
           pathPreview: preview,
           reachedGoal: false,
-          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
           activeTreeNodeId: currentTreeNodeId,
           rejectedChild: null,
         })
@@ -460,7 +460,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
           closedSet: [...closedSet],
           pathPreview: preview,
           reachedGoal: false,
-          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
           activeTreeNodeId: currentTreeNodeId,
           rejectedChild: null,
         })
@@ -475,15 +475,15 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
           closedSet: [...closedSet],
           pathPreview: currentPath,
           reachedGoal: false,
-          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
           activeTreeNodeId: currentTreeNodeId,
           rejectedChild: {
             tile: neighbor,
             parentTreeNodeId: currentTreeNodeId,
             actionFromParent: action,
             g: tentativeG,
-            h: manhattanDistance(neighbor, goal),
-            f: tentativeG + manhattanDistance(neighbor, goal),
+            h: heuristic(neighbor, goal),
+            f: tentativeG + heuristic(neighbor, goal),
             reason: 'not-better',
           },
         })
@@ -502,7 +502,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
       closedSet: [...closedSet],
       pathPreview: finalPath,
       reachedGoal: false,
-      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
       activeTreeNodeId: bestTreeNodeByTile[start] ?? rootTreeNode.id,
       rejectedChild: null,
     })
@@ -517,7 +517,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
       closedSet: [...closedSet],
       pathPreview: finalPath,
       reachedGoal: true,
-      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal, heuristic),
       activeTreeNodeId: bestTreeNodeByTile[goal] ?? bestTreeNodeByTile[start] ?? rootTreeNode.id,
       rejectedChild: null,
     })
@@ -528,6 +528,7 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
     path: finalPath,
     actions: finalActions,
     reachedGoal,
+    heuristicAnalysis: heuristicDefinition.analysis,
   }
 }
 

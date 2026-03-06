@@ -27,7 +27,8 @@ button {
 }
 
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -101,6 +102,7 @@ select {
   padding: 10px;
   min-width: 0;
   justify-content: center;
+  overflow: hidden;
 }
 
 .full-span-card {
@@ -127,6 +129,13 @@ select {
 dl,
 dd {
   margin: 0;
+}
+
+.board-grid-shell {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
 }
 
 .board-grid {
@@ -505,6 +514,111 @@ dd {
   border-radius: 10px;
   padding: 8px 10px;
   background: #ffffff;
+}
+
+.heuristic-panel {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heuristic-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.92rem;
+  color: #3f4a63;
+}
+
+.heuristic-input {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  border: 1px solid #c6d0e1;
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: #ffffff;
+  line-height: 1.45;
+  font-family:
+    ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+.heuristic-input-invalid {
+  border-color: #dc2626;
+  background: #fff5f5;
+}
+
+.heuristic-hint,
+.heuristic-error {
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.heuristic-hint {
+  color: #55627d;
+}
+
+.heuristic-error {
+  color: #b91c1c;
+}
+
+.heuristic-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.heuristic-status-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.heuristic-status-tag-true {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.heuristic-status-tag-false {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
+.heuristic-counterexample-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.heuristic-counterexample-card {
+  border: 1px solid #f1c3c3;
+  border-radius: 16px;
+  padding: 14px 16px;
+  background: linear-gradient(180deg, #fffefe, #fff5f5);
+}
+
+.heuristic-counterexample-card h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.heuristic-counterexample-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #4b5563;
+  font-size: 0.9rem;
 }
 
 .speed-row {
@@ -1041,6 +1155,14 @@ dd {
   background: #ffffff;
 }
 
+.primary-button:disabled,
+.secondary-button:disabled,
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.64;
+  transform: none;
+}
+
 .probability-block + .probability-block {
   margin-top: 18px;
 }
@@ -1265,13 +1387,27 @@ dd {
   }
 
   .board-grid {
-    --label-col-size: 32px;
-    --label-row-size: 24px;
-    --cell-size: 78px;
+    --label-col-size: 24px;
+    --label-row-size: 20px;
+    --cell-size: min(78px, calc((100vw - 76px) / var(--board-columns)));
   }
 
   .board-cell {
-    padding: 10px;
+    padding: 4px;
+  }
+
+  .axis-label {
+    font-size: 0.75rem;
+  }
+
+  .cell-id {
+    font-size: clamp(1rem, 5vw, 1.3rem);
+  }
+
+  .cell-score {
+    right: 2px;
+    bottom: 2px;
+    font-size: 0.52rem;
   }
 
   .state-grid,
