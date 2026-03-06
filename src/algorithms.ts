@@ -99,6 +99,7 @@ export type AStarTreeNodeSnapshot = {
 export type MCTSFrame = {
   kind: 'mcts'
   step: number
+  decisionStep: number
   iteration: number
   explorationConstant: number
   gamma: number
@@ -115,8 +116,12 @@ export type MCTSFrame = {
 export type MCTSResult = {
   frames: MCTSFrame[]
   tree: MCTSTreeNodeSnapshot[]
-  recommendedPath: TileId[]
-  recommendedActions: Action[]
+  selectedAction: Action | null
+  selectedActionVisits: number
+  nextTile: TileId
+  transitionExplanation: string | null
+  terminated: boolean
+  terminationReason: 'goal' | 'trap' | 'no-action' | null
 }
 
 type AStarConfig = {
@@ -127,6 +132,7 @@ type AStarConfig = {
 type MCTSConfig = {
   start: TileId
   goal: TileId
+  decisionStep?: number
   iterations: number
   explorationConstant: number
   gamma: number
@@ -562,6 +568,10 @@ function discountedRewardForTile(
   return Math.pow(gamma, Math.max(0, stepsAhead)) * baseReward
 }
 
+function isTerminalTile(tile: TileId, goal: TileId) {
+  return tile === goal || getTileType(tile) === 'T'
+}
+
 function createRng(defaultRng?: () => number) {
   if (defaultRng) {
     return defaultRng
@@ -578,6 +588,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
   const {
     start,
     goal,
+    decisionStep = 0,
     explorationConstant,
     gamma,
     iterations,
@@ -632,13 +643,21 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
   const pushFrame = (
     payload: Omit<
       MCTSFrame,
-      'kind' | 'step' | 'bestRootAction' | 'bestRootVisits' | 'tree' | 'explorationConstant' | 'gamma'
+      | 'kind'
+      | 'step'
+      | 'decisionStep'
+      | 'bestRootAction'
+      | 'bestRootVisits'
+      | 'tree'
+      | 'explorationConstant'
+      | 'gamma'
     >,
   ) => {
     const best = getBestRootAction()
     frames.push({
       kind: 'mcts',
       step: step++,
+      decisionStep,
       explorationConstant,
       gamma,
       bestRootAction: best.action,
@@ -651,11 +670,37 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
   pushFrame({
     iteration: 0,
     phase: 'init',
-    message: `Initialized MCTS at ${start} with c=${explorationConstant.toFixed(3)}, gamma=${gamma.toFixed(3)}, and horizon=${rolloutHorizon}.`,
+    message: `Initialized planning step ${decisionStep + 1} at ${start} with c=${explorationConstant.toFixed(3)}, gamma=${gamma.toFixed(3)}, and horizon=${rolloutHorizon}.`,
     activeNodeId: root.id,
     selectionPathIds: [root.id],
     rolloutTiles: [start],
   })
+
+  if (isTerminalTile(start, goal)) {
+    const terminationReason = start === goal ? 'goal' : 'trap'
+    pushFrame({
+      iteration: 0,
+      phase: 'finished',
+      message:
+        terminationReason === 'goal'
+          ? `Planning step ${decisionStep + 1} stops immediately because ${start} is already the goal.`
+          : `Planning step ${decisionStep + 1} stops immediately because ${start} is a trap state.`,
+      activeNodeId: root.id,
+      selectionPathIds: [root.id],
+      rolloutTiles: [start],
+    })
+
+    return {
+      frames,
+      tree: snapshotTree(nodes, explorationConstant),
+      selectedAction: null,
+      selectedActionVisits: 0,
+      nextTile: start,
+      transitionExplanation: null,
+      terminated: true,
+      terminationReason,
+    }
+  }
 
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     const selectionPath: number[] = [root.id]
@@ -708,7 +753,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       })
     }
 
-    if (current.untriedActions.length > 0) {
+    if (!isTerminalTile(current.tile, goal) && current.untriedActions.length > 0) {
       const actionIndex = Math.floor(rng() * current.untriedActions.length)
       const [action] = current.untriedActions.splice(actionIndex, 1)
       const nextState = sampleTransition(current.tile, action, rng, goal).destination
@@ -720,7 +765,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
         depth: current.depth + 1,
         visits: 0,
         valueSum: 0,
-        untriedActions: [...ACTIONS],
+        untriedActions: isTerminalTile(nextState, goal) ? [] : [...ACTIONS],
         childrenByAction: {},
       }
       nodes.set(child.id, child)
@@ -742,7 +787,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
     let rolloutState = current.tile
     const remainingSteps = Math.max(0, rolloutHorizon - current.depth)
     for (let rolloutStep = 0; rolloutStep < remainingSteps; rolloutStep += 1) {
-      if (rolloutState === goal || getTileType(rolloutState) === 'T') {
+      if (isTerminalTile(rolloutState, goal)) {
         break
       }
       const action = ACTIONS[Math.floor(rng() * ACTIONS.length)]
@@ -798,54 +843,43 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
     })
   }
 
-  const recommendedActions: Action[] = []
-  const recommendedPath: TileId[] = [start]
-  let cursor = root
+  const best = getBestRootAction()
+  let nextTile = start
+  let transitionExplanation: string | null = null
+  let terminated = false
+  let terminationReason: MCTSResult['terminationReason'] = null
 
-  for (let depth = 0; depth < rolloutHorizon; depth += 1) {
-    if (cursor.tile === goal || getTileType(cursor.tile) === 'T') {
-      break
+  if (best.action) {
+    const executedTransition = sampleTransition(start, best.action, rng, goal)
+    nextTile = executedTransition.destination
+    transitionExplanation = executedTransition.explanation
+    terminated = isTerminalTile(nextTile, goal)
+    if (terminated) {
+      terminationReason = nextTile === goal ? 'goal' : 'trap'
     }
-
-    let bestChild: InternalMCTSNode | null = null
-    let bestAction: Action | null = null
-    for (const action of ACTIONS) {
-      const childId = cursor.childrenByAction[action]
-      if (childId === undefined) {
-        continue
-      }
-      const child = nodes.get(childId)
-      if (!child) {
-        continue
-      }
-      if (!bestChild || child.visits > bestChild.visits) {
-        bestChild = child
-        bestAction = action
-      }
-    }
-
-    if (!bestChild || !bestAction) {
-      break
-    }
-
-    recommendedActions.push(bestAction)
-    recommendedPath.push(bestChild.tile)
-    cursor = bestChild
+  } else {
+    terminationReason = 'no-action'
   }
 
   pushFrame({
     iteration: iterations,
     phase: 'finished',
-    message: `MCTS finished ${iterations} iterations.`,
+    message: best.action
+      ? `Planning step ${decisionStep + 1} finished ${iterations} iterations and selected ${best.action}, leading to ${nextTile}.`
+      : `Planning step ${decisionStep + 1} finished ${iterations} iterations without selecting an action.`,
     activeNodeId: root.id,
     selectionPathIds: [root.id],
-    rolloutTiles: recommendedPath,
+    rolloutTiles: best.action ? [start, nextTile] : [start],
   })
 
   return {
     frames,
     tree: snapshotTree(nodes, explorationConstant),
-    recommendedPath,
-    recommendedActions,
+    selectedAction: best.action,
+    selectedActionVisits: best.visits,
+    nextTile,
+    transitionExplanation,
+    terminated,
+    terminationReason,
   }
 }

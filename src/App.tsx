@@ -43,6 +43,18 @@ type ExecutionFrame = {
   from: TileId | null
   action: Action | null
   path: TileId[]
+  mctsHistoryIndex: number | null
+}
+
+type MCTSGraphHistoryEntry = {
+  decisionStep: number
+  rootTile: TileId
+  resultingTile: TileId
+  incomingAction: Action | null
+  selectedAction: Action | null
+  bestRootVisits: number
+  frame: MCTSFrame
+  rolloutPathByNodeId: Map<number, TileId[]>
 }
 
 type TokenAnimation = {
@@ -171,6 +183,7 @@ function buildExecutionFrames(path: TileId[], actions: Action[]) {
       from: null,
       action: null,
       path: [path[0]],
+      mctsHistoryIndex: null,
     },
   ]
 
@@ -184,10 +197,41 @@ function buildExecutionFrames(path: TileId[], actions: Action[]) {
       from: path[index - 1],
       action: actions[index - 1] ?? null,
       path: path.slice(0, index + 1),
+      mctsHistoryIndex: null,
     })
   }
 
   return frames
+}
+
+function buildExecutionFrame({
+  timelineStep,
+  tile,
+  from,
+  action,
+  path,
+  message,
+  mctsHistoryIndex,
+}: {
+  timelineStep: number
+  tile: TileId
+  from: TileId | null
+  action: Action | null
+  path: TileId[]
+  message: string
+  mctsHistoryIndex: number | null
+}) {
+  return {
+    kind: 'execution' as const,
+    step: timelineStep,
+    phase: 'execution' as const,
+    message,
+    tile,
+    from,
+    action,
+    path,
+    mctsHistoryIndex,
+  }
 }
 
 function MiniBoardState({
@@ -371,6 +415,8 @@ type MCTSFlowNodeData = {
   simulationPath: TileId[]
   simulationIndicatorToTile: TileId | null
   goalTile: TileId
+  boardSize: number
+  compact: boolean
 }
 
 type AStarRenderNodeStatus = AStarTreeNodeSnapshot['status'] | 'rejected'
@@ -398,9 +444,102 @@ type AStarFlowNodeData = {
 type SearchFlowNodeData = MCTSFlowNodeData | AStarFlowNodeData
 type SearchFlowNodeType = Node<SearchFlowNodeData, 'searchNode'>
 
+type MCTSTreeLayoutConfig = {
+  nodeWidth: number
+  nodeHeight: number
+  boardSize: number
+  nodesep: number
+  ranksep: number
+  margin: number
+  minZoom: number
+  fitViewPadding: number
+  edgeType: 'straight'
+  edgePathOffset: number
+  showLabels: boolean
+  compact: boolean
+  activeEdgeWidth: number
+  inactiveEdgeWidth: number
+  markerSize: number
+}
+
+type MCTSTreeDiagram = {
+  nodes: SearchFlowNodeType[]
+  edges: Edge[]
+  minZoom: number
+  fitViewPadding: number
+}
+
 const SEARCH_NODE_WIDTH = 256
 const SEARCH_NODE_HEIGHT = 188
 const SEARCH_NODE_BOARD_SIZE = 110
+
+function getMCTSTreeLayoutConfig(nodeCount: number): MCTSTreeLayoutConfig {
+  if (nodeCount >= 52) {
+    return {
+      nodeWidth: 198,
+      nodeHeight: 146,
+      boardSize: 78,
+      nodesep: 20,
+      ranksep: 40,
+      margin: 16,
+      minZoom: 0.08,
+      fitViewPadding: 0.07,
+      edgeType: 'straight',
+      edgePathOffset: 24,
+      showLabels: false,
+      compact: true,
+      activeEdgeWidth: 3,
+      inactiveEdgeWidth: 2.4,
+      markerSize: 14,
+    }
+  }
+
+  if (nodeCount >= 26) {
+    return {
+      nodeWidth: 224,
+      nodeHeight: 166,
+      boardSize: 92,
+      nodesep: 28,
+      ranksep: 54,
+      margin: 20,
+      minZoom: 0.12,
+      fitViewPadding: 0.1,
+      edgeType: 'straight',
+      edgePathOffset: 28,
+      showLabels: true,
+      compact: true,
+      activeEdgeWidth: 3,
+      inactiveEdgeWidth: 2.4,
+      markerSize: 16,
+    }
+  }
+
+  return {
+    nodeWidth: SEARCH_NODE_WIDTH,
+    nodeHeight: SEARCH_NODE_HEIGHT,
+    boardSize: SEARCH_NODE_BOARD_SIZE,
+    nodesep: 46,
+    ranksep: 86,
+    margin: 28,
+    minZoom: 0.18,
+    fitViewPadding: 0.16,
+    edgeType: 'straight',
+    edgePathOffset: 32,
+    showLabels: true,
+    compact: false,
+    activeEdgeWidth: 2.8,
+    inactiveEdgeWidth: 2.2,
+    markerSize: 18,
+  }
+}
+
+function clampPlaybackMs(value: number) {
+  if (!Number.isFinite(value)) {
+    return 1
+  }
+
+  return Math.min(5000, Math.max(1, Math.round(value)))
+}
 
 function formatUcb(ucb: number | null) {
   if (ucb === null) {
@@ -427,7 +566,9 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
     const node = data.snapshot
 
     return (
-      <div className={`mcts-flow-node ${data.active ? 'mcts-flow-node-active' : ''}`}>
+      <div
+        className={`mcts-flow-node ${data.compact ? 'mcts-flow-node-compact' : ''} ${data.active ? 'mcts-flow-node-active' : ''}`}
+      >
         <Handle type="target" position={Position.Top} className="mcts-flow-handle" />
         <div className="tree-node-header">
           <span className="tree-node-id">#{node.id}</span>
@@ -440,7 +581,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
           simulationPath={data.simulationPath}
           simulationIndicatorToTile={data.simulationIndicatorToTile}
           goalTile={data.goalTile}
-          size={SEARCH_NODE_BOARD_SIZE}
+          size={data.boardSize}
         />
         <div className="tree-node-stats">
           <span>n={node.visits}</span>
@@ -478,16 +619,22 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
   )
 }
 
-function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number, TileId[]>, goalTile: TileId) {
+function buildMCTSTreeDiagram(
+  frame: MCTSFrame,
+  rolloutPathByNodeId: Map<number, TileId[]>,
+  goalTile: TileId,
+  graphIdPrefix = `mcts-${frame.decisionStep}`,
+): MCTSTreeDiagram {
   const { tree, activeNodeId } = frame
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
+  const layout = getMCTSTreeLayoutConfig(tree.length)
   graph.setGraph({
     rankdir: 'TB',
-    nodesep: 46,
-    ranksep: 86,
-    marginx: 28,
-    marginy: 28,
+    nodesep: layout.nodesep,
+    ranksep: layout.ranksep,
+    marginx: layout.margin,
+    marginy: layout.margin,
   })
 
   const orderedTree = [...tree].sort((left, right) => {
@@ -506,8 +653,8 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
 
   for (const node of orderedTree) {
     graph.setNode(String(node.id), {
-      width: SEARCH_NODE_WIDTH,
-      height: SEARCH_NODE_HEIGHT,
+      width: layout.nodeWidth,
+      height: layout.nodeHeight,
     })
   }
 
@@ -541,17 +688,19 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
         simulationPath,
         simulationIndicatorToTile,
         goalTile,
+        boardSize: layout.boardSize,
+        compact: layout.compact,
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
       draggable: false,
       selectable: false,
       position: {
-        x: position.x - SEARCH_NODE_WIDTH / 2,
-        y: position.y - SEARCH_NODE_HEIGHT / 2,
+        x: position.x - layout.nodeWidth / 2,
+        y: position.y - layout.nodeHeight / 2,
       },
-      width: SEARCH_NODE_WIDTH,
-      height: SEARCH_NODE_HEIGHT,
+      width: layout.nodeWidth,
+      height: layout.nodeHeight,
     }
   })
 
@@ -564,14 +713,15 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
     const stroke = isActive ? '#2563eb' : '#9fb3d8'
     return [
       {
-        id: `${node.parentId}-${node.id}`,
+        id: `${graphIdPrefix}-${node.parentId}-${node.id}`,
         source: String(node.parentId),
         target: String(node.id),
-        type: 'smoothstep',
+        type: layout.edgeType,
         animated: isActive,
-        label: describeAction(node.actionFromParent),
+        label: layout.showLabels ? describeAction(node.actionFromParent) : undefined,
+        zIndex: 10,
         labelStyle: {
-          fontSize: 10,
+          fontSize: layout.compact ? 9 : 10,
           fontWeight: 700,
           fill: stroke,
         },
@@ -583,20 +733,26 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
           stroke: '#d9e1ee',
         },
         markerEnd: {
+          id: `${graphIdPrefix}-marker-${node.parentId}-${node.id}`,
           type: MarkerType.ArrowClosed,
-          width: 18,
-          height: 18,
+          width: layout.markerSize,
+          height: layout.markerSize,
           color: stroke,
         },
         style: {
           stroke,
-          strokeWidth: isActive ? 2.8 : 2.2,
+          strokeWidth: isActive ? layout.activeEdgeWidth : layout.inactiveEdgeWidth,
         },
       },
     ]
   })
 
-  return { nodes, edges }
+  return {
+    nodes,
+    edges,
+    minZoom: layout.minZoom,
+    fitViewPadding: layout.fitViewPadding,
+  }
 }
 
 function getLatestSearchFrame(frames: DemoFrame[], index: number) {
@@ -608,6 +764,39 @@ function getLatestSearchFrame(frames: DemoFrame[], index: number) {
   }
 
   return null
+}
+
+function buildMCTSRolloutPathByNodeId(frames: MCTSFrame[]) {
+  const rolloutPathMap = new Map<number, TileId[]>()
+
+  for (const frame of frames) {
+    if (frame.phase !== 'rollout' || frame.activeNodeId === null) {
+      continue
+    }
+
+    rolloutPathMap.set(frame.activeNodeId, [...frame.rolloutTiles])
+  }
+
+  return rolloutPathMap
+}
+
+function getCommittedMCTSPath(frames: DemoFrame[], index: number, fallback: TileId) {
+  const visibleFrames = frames.slice(0, index + 1)
+  const latestExecutionFrame = [...visibleFrames]
+    .reverse()
+    .find((frame): frame is ExecutionFrame => isExecutionFrame(frame) && frame.mctsHistoryIndex !== null)
+
+  if (latestExecutionFrame) {
+    return latestExecutionFrame.path
+  }
+
+  const firstMCTSFrame = visibleFrames.find(isMCTSFrame) ?? frames.find(isMCTSFrame)
+  if (!firstMCTSFrame) {
+    return [fallback]
+  }
+
+  const rootTile = firstMCTSFrame.tree[0]?.tile ?? fallback
+  return [rootTile]
 }
 
 function buildAStarTreePath(nodeId: string, nodeById: Map<string, AStarRenderNodeSnapshot>) {
@@ -797,7 +986,7 @@ function buildAStarNavigationDiagram(frame: AStarFrame, goalTile: TileId) {
       id: edgeId,
       source: parentTile,
       target: childTile,
-      type: 'smoothstep',
+      type: 'straight',
       animated: snapshot.status === 'active' || status === 'rejected',
       label: describeAction(action),
       labelStyle: {
@@ -827,15 +1016,6 @@ function buildAStarNavigationDiagram(frame: AStarFrame, goalTile: TileId) {
   })
 
   return { nodes, edges }
-}
-
-function getSelectionTiles(frame: MCTSFrame) {
-  const nodeById = new Map(frame.tree.map((node) => [node.id, node]))
-
-  return frame.selectionPathIds.flatMap((nodeId) => {
-    const node = nodeById.get(nodeId)
-    return node ? [node.tile] : []
-  })
 }
 
 function getFrameTile(frame: DemoFrame | null, fallback: TileId) {
@@ -882,6 +1062,8 @@ function App() {
   const [mctsHorizon, setMctsHorizon] = useState(100)
   const [mctsGoalReward, setMctsGoalReward] = useState(10)
   const [mctsTrapReward, setMctsTrapReward] = useState(-1)
+  const [mctsGraphHistory, setMctsGraphHistory] = useState<MCTSGraphHistoryEntry[]>([])
+  const [selectedHistoricalMCTSGraphIndex, setSelectedHistoricalMCTSGraphIndex] = useState<number | null>(null)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
   const tokenAnimationCounterRef = useRef(0)
   const tokenAnimationTimerRef = useRef<number | null>(null)
@@ -893,16 +1075,32 @@ function App() {
     [demoFrames, demoIndex],
   )
   const displayedAStarFrame = isAStarFrame(latestSearchFrame) ? latestSearchFrame : null
-  const displayedMCTSFrame = isMCTSFrame(latestSearchFrame) ? latestSearchFrame : null
-  const visibleTile = getFrameTile(activeFrame, currentTile)
-  const currentType = getTileType(visibleTile)
-  const restingTokenPosition = getTokenPosition(visibleTile)
+  const currentMCTSFrame = isMCTSFrame(latestSearchFrame) ? latestSearchFrame : null
+  const activeMCTSGraphIndex =
+    isMCTSFrame(activeFrame) ? activeFrame.decisionStep : isExecutionFrame(activeFrame) ? activeFrame.mctsHistoryIndex : null
+  const displayedHistoricalMCTSHistoryEntry =
+    selectedHistoricalMCTSGraphIndex === null
+      ? null
+      : mctsGraphHistory[selectedHistoricalMCTSGraphIndex] ?? null
+  const isViewingMCTSPlayback =
+    currentMCTSFrame !== null || (isExecutionFrame(activeFrame) && activeFrame.mctsHistoryIndex !== null)
+  const frameVisibleTile = getFrameTile(activeFrame, currentTile)
 
   const astarOpenSet = isAStarFrame(activeFrame) ? new Set(activeFrame.openSet) : null
   const astarClosedSet = isAStarFrame(activeFrame) ? new Set(activeFrame.closedSet) : null
-  const mctsRolloutTiles = isMCTSFrame(activeFrame) ? new Set(activeFrame.rolloutTiles) : null
   const astarPathTiles = isAStarFrame(activeFrame) ? new Set(activeFrame.pathPreview) : null
   const astarPathSegments = isAStarFrame(activeFrame) ? buildPathSegments(activeFrame.pathPreview) : []
+  const mctsCommittedPath = useMemo(
+    () => getCommittedMCTSPath(demoFrames, demoIndex, currentTile),
+    [currentTile, demoFrames, demoIndex],
+  )
+  const mctsCommittedTileSet = useMemo(() => new Set(mctsCommittedPath), [mctsCommittedPath])
+  const mctsCommittedSegments = useMemo(() => buildPathSegments(mctsCommittedPath), [mctsCommittedPath])
+  const visibleTile = isViewingMCTSPlayback
+    ? mctsCommittedPath[mctsCommittedPath.length - 1] ?? currentTile
+    : frameVisibleTile
+  const currentType = getTileType(visibleTile)
+  const restingTokenPosition = getTokenPosition(visibleTile)
   const astarHasDistinctNeighbor =
     isAStarFrame(activeFrame) &&
     activeFrame.current !== null &&
@@ -915,32 +1113,40 @@ function App() {
         : new Map<TileId, AStarFrame['scoreRows'][number]>(),
     [displayedAStarFrame],
   )
-  const mctsSelectionTiles = isMCTSFrame(activeFrame) ? getSelectionTiles(activeFrame) : []
-  const mctsSelectionTileSet = isMCTSFrame(activeFrame) ? new Set(mctsSelectionTiles) : null
-  const mctsSelectionSegments = isMCTSFrame(activeFrame) ? buildPathSegments(mctsSelectionTiles) : []
-  const mctsRolloutSegments = isMCTSFrame(activeFrame) ? buildPathSegments(activeFrame.rolloutTiles) : []
-  const mctsRolloutPathByNodeId = useMemo(() => {
-    const rolloutPathMap = new Map<number, TileId[]>()
+  const displayedMCTSFrame =
+    isMCTSFrame(activeFrame) && activeMCTSGraphIndex === selectedHistoricalMCTSGraphIndex
+      ? activeFrame
+      : displayedHistoricalMCTSHistoryEntry?.frame ?? currentMCTSFrame
+  const displayedMCTSRolloutPathByNodeId = useMemo(() => {
+    if (isMCTSFrame(activeFrame) && activeMCTSGraphIndex === selectedHistoricalMCTSGraphIndex) {
+      const currentStepFrames = demoFrames
+        .slice(0, demoIndex + 1)
+        .filter(
+          (frame): frame is MCTSFrame =>
+            isMCTSFrame(frame) && frame.decisionStep === activeFrame.decisionStep,
+        )
 
-    for (const frame of demoFrames.slice(0, demoIndex + 1)) {
-      if (!isMCTSFrame(frame) || frame.phase !== 'rollout' || frame.activeNodeId === null) {
-        continue
-      }
-
-      rolloutPathMap.set(frame.activeNodeId, [...frame.rolloutTiles])
+      return buildMCTSRolloutPathByNodeId(currentStepFrames)
     }
 
-    return rolloutPathMap
-  }, [demoFrames, demoIndex])
-  const mctsTreeDiagram = useMemo(
+    return displayedHistoricalMCTSHistoryEntry?.rolloutPathByNodeId ?? new Map<number, TileId[]>()
+  }, [activeFrame, activeMCTSGraphIndex, demoFrames, demoIndex, displayedHistoricalMCTSHistoryEntry, selectedHistoricalMCTSGraphIndex])
+  const currentMCTSTreeDiagram = useMemo(
     () =>
       displayedMCTSFrame
-        ? buildMCTSTreeDiagram(displayedMCTSFrame, mctsRolloutPathByNodeId, goalTile)
+        ? buildMCTSTreeDiagram(
+            displayedMCTSFrame,
+            displayedMCTSRolloutPathByNodeId,
+            goalTile,
+            `mcts-current-${displayedMCTSFrame.decisionStep}`,
+          )
         : {
             nodes: [] as SearchFlowNodeType[],
             edges: [] as Edge[],
+            minZoom: 0.18,
+            fitViewPadding: 0.16,
           },
-    [displayedMCTSFrame, goalTile, mctsRolloutPathByNodeId],
+    [displayedMCTSFrame, displayedMCTSRolloutPathByNodeId, goalTile],
   )
   const astarGraphDiagram = useMemo(
     () =>
@@ -953,20 +1159,11 @@ function App() {
     [displayedAStarFrame, goalTile],
   )
   const searchNodeTypes = useMemo(() => ({ searchNode: SearchFlowNodeCard }), [])
-  const displayedMCTSSelectionTiles = displayedMCTSFrame ? getSelectionTiles(displayedMCTSFrame) : []
-  const mctsPlaybackTiles = displayedMCTSFrame
-    ? displayedMCTSFrame.phase === 'selection'
-      ? displayedMCTSSelectionTiles
-      : displayedMCTSFrame.rolloutTiles.length > 0
-        ? displayedMCTSFrame.rolloutTiles
-        : displayedMCTSSelectionTiles
-    : []
-  const mctsPlaybackFocusTile =
-    mctsPlaybackTiles[mctsPlaybackTiles.length - 1] ?? (displayedMCTSFrame ? visibleTile : currentTile)
-  const astarCurrentScores =
-    displayedAStarFrame && displayedAStarFrame.current
-      ? astarScoreMap.get(displayedAStarFrame.current) ?? null
-      : null
+  const canViewPreviousHistoricalGraph =
+    selectedHistoricalMCTSGraphIndex !== null && selectedHistoricalMCTSGraphIndex > 0
+  const canViewNextHistoricalGraph =
+    selectedHistoricalMCTSGraphIndex !== null &&
+    selectedHistoricalMCTSGraphIndex < mctsGraphHistory.length - 1
 
   const clearTokenAnimation = useCallback(() => {
     if (tokenAnimationTimerRef.current !== null) {
@@ -1019,12 +1216,34 @@ function App() {
     [],
   )
 
+  useEffect(() => {
+    if (mctsGraphHistory.length === 0) {
+      setSelectedHistoricalMCTSGraphIndex(null)
+      return
+    }
+
+    if (activeMCTSGraphIndex !== null) {
+      setSelectedHistoricalMCTSGraphIndex(activeMCTSGraphIndex)
+      return
+    }
+
+    setSelectedHistoricalMCTSGraphIndex((current) => {
+      if (current === null) {
+        return 0
+      }
+
+      return Math.min(mctsGraphHistory.length - 1, Math.max(0, current))
+    })
+  }, [activeMCTSGraphIndex, mctsGraphHistory])
+
   const handleReset = useCallback(() => {
     clearTokenAnimation()
     setCurrentTile(getRandomStartTile())
     setDemoFrames([])
     setDemoIndex(0)
     setIsAutoPlay(false)
+    setMctsGraphHistory([])
+    setSelectedHistoricalMCTSGraphIndex(null)
   }, [clearTokenAnimation])
 
   const performStep = useCallback(
@@ -1084,27 +1303,82 @@ function App() {
       }))
       setDemoFrames([...result.frames, ...executionFrames])
       setDemoIndex(0)
+      setMctsGraphHistory([])
+      setSelectedHistoricalMCTSGraphIndex(null)
       return
     }
 
-    const result = runMCTSDemo({
-      start: currentTile,
-      goal: goalTile,
-      iterations: mctsIterations,
-      explorationConstant: mctsExplorationC,
-      gamma: mctsGamma,
-      rolloutHorizon: mctsHorizon,
-      goalReward: mctsGoalReward,
-      trapReward: mctsTrapReward,
-    })
-    const executionFrames = buildExecutionFrames(result.recommendedPath, result.recommendedActions).map(
-      (frame, index) => ({
+    const nextDemoFrames: DemoFrame[] = []
+    const nextGraphHistory: MCTSGraphHistoryEntry[] = []
+    const executionPath: TileId[] = [currentTile]
+    let planningTile = currentTile
+    let timelineStep = 0
+    let decisionStep = 0
+    let incomingAction: Action | null = null
+
+    while (true) {
+      const result = runMCTSDemo({
+        start: planningTile,
+        goal: goalTile,
+        decisionStep,
+        iterations: mctsIterations,
+        explorationConstant: mctsExplorationC,
+        gamma: mctsGamma,
+        rolloutHorizon: mctsHorizon,
+        goalReward: mctsGoalReward,
+        trapReward: mctsTrapReward,
+        rng: Math.random,
+      })
+
+      const searchFrames = result.frames.map((frame) => ({
         ...frame,
-        step: result.frames.length + index,
-      }),
-    )
-    setDemoFrames([...result.frames, ...executionFrames])
+        step: timelineStep++,
+      }))
+      nextDemoFrames.push(...searchFrames)
+
+      const finalFrame = searchFrames[searchFrames.length - 1]!
+      const historyIndex = nextGraphHistory.length
+      nextGraphHistory.push({
+        decisionStep,
+        rootTile: planningTile,
+        resultingTile: result.nextTile,
+        incomingAction,
+        selectedAction: result.selectedAction,
+        bestRootVisits: result.selectedActionVisits,
+        frame: finalFrame,
+        rolloutPathByNodeId: buildMCTSRolloutPathByNodeId(result.frames),
+      })
+
+      if (!result.selectedAction) {
+        break
+      }
+
+      executionPath.push(result.nextTile)
+      nextDemoFrames.push(
+        buildExecutionFrame({
+          timelineStep: timelineStep++,
+          tile: result.nextTile,
+          from: planningTile,
+          action: result.selectedAction,
+          path: [...executionPath],
+          message: `Execution step ${executionPath.length - 1}: ${planningTile} --${result.selectedAction}--> ${result.nextTile}. ${result.transitionExplanation ?? ''}`.trim(),
+          mctsHistoryIndex: historyIndex,
+        }),
+      )
+
+      if (result.terminated) {
+        break
+      }
+
+      incomingAction = result.selectedAction
+      planningTile = result.nextTile
+      decisionStep += 1
+    }
+
+    setDemoFrames(nextDemoFrames)
     setDemoIndex(0)
+    setMctsGraphHistory(nextGraphHistory)
+    setSelectedHistoricalMCTSGraphIndex(nextGraphHistory.length > 0 ? 0 : null)
   }, [
     algorithm,
     clearTokenAnimation,
@@ -1117,6 +1391,25 @@ function App() {
     mctsIterations,
     mctsTrapReward,
   ])
+  const goToPreviousHistoricalGraph = useCallback(() => {
+    setIsAutoPlay(false)
+    setSelectedHistoricalMCTSGraphIndex((current) => {
+      if (current === null) {
+        return null
+      }
+      return Math.max(0, current - 1)
+    })
+  }, [])
+
+  const goToNextHistoricalGraph = useCallback(() => {
+    setIsAutoPlay(false)
+    setSelectedHistoricalMCTSGraphIndex((current) => {
+      if (current === null) {
+        return mctsGraphHistory.length > 0 ? 0 : null
+      }
+      return Math.min(mctsGraphHistory.length - 1, current + 1)
+    })
+  }, [mctsGraphHistory.length])
 
   useEffect(() => {
     if (!isAutoPlay || demoFrames.length === 0) {
@@ -1222,14 +1515,13 @@ function App() {
                   const isGoal = tileId === goalTile
                   const isOpen = astarOpenSet?.has(tileId) ?? false
                   const isClosed = astarClosedSet?.has(tileId) ?? false
-                  const isRollout = mctsRolloutTiles?.has(tileId) ?? false
                   const isAStarPath = astarPathTiles?.has(tileId) ?? false
-                  const isSelectionPath = mctsSelectionTileSet?.has(tileId) ?? false
+                  const isMCTSPath = isViewingMCTSPlayback && mctsCommittedTileSet.has(tileId)
                   const scoreRow = astarScoreMap.get(tileId)
 
                   return (
                     <div
-                      className={`board-cell ${tileClassName(tileId)} ${isCurrent ? 'current-cell' : ''} ${isGoal ? 'goal-cell' : ''} ${isOpen ? 'open-cell' : ''} ${isClosed ? 'closed-cell' : ''} ${isRollout ? 'rollout-cell' : ''} ${isAStarPath ? 'path-preview-cell' : ''} ${isSelectionPath ? 'selection-path-cell' : ''}`}
+                      className={`board-cell ${tileClassName(tileId)} ${isCurrent ? 'current-cell' : ''} ${isGoal ? 'goal-cell' : ''} ${isOpen ? 'open-cell' : ''} ${isClosed ? 'closed-cell' : ''} ${isAStarPath ? 'path-preview-cell' : ''} ${isMCTSPath ? 'committed-path-cell' : ''}`}
                       key={tileId}
                     >
                       <span className="cell-id">{tileId}</span>
@@ -1280,7 +1572,7 @@ function App() {
                         className="astar-path-segment"
                         style={{
                           opacity: String(0.28 + progress * 0.72),
-                          strokeWidth: String(0.05 + progress * 0.05),
+                          strokeWidth: String(4.1 + progress * 1),
                         }}
                       />
                     )
@@ -1313,29 +1605,22 @@ function App() {
                       </>
                     )
                   })()}
-                {isMCTSFrame(activeFrame) &&
-                  mctsSelectionSegments.map((segment, index) => (
-                    <line
-                      key={`selection-${segment.start}-${segment.end}-${index}`}
-                      x1={segment.startPoint.x}
-                      y1={segment.startPoint.y}
-                      x2={segment.endPoint.x}
-                      y2={segment.endPoint.y}
-                      className="mcts-selection-segment"
-                    />
-                  ))}
-                {isMCTSFrame(activeFrame) &&
-                  mctsRolloutSegments.map((segment, index) => {
-                    const progress = (index + 1) / Math.max(1, mctsRolloutSegments.length)
+                {isViewingMCTSPlayback &&
+                  mctsCommittedSegments.map((segment, index) => {
+                    const proximityToFocus =
+                      (index + 1) / Math.max(1, mctsCommittedSegments.length)
                     return (
                       <line
-                        key={`rollout-${segment.start}-${segment.end}-${index}`}
+                        key={`mcts-committed-${segment.start}-${segment.end}-${index}`}
                         x1={segment.startPoint.x}
                         y1={segment.startPoint.y}
                         x2={segment.endPoint.x}
                         y2={segment.endPoint.y}
-                        className="mcts-rollout-segment"
-                        style={{ opacity: String(0.3 + progress * 0.7) }}
+                        className="mcts-committed-segment"
+                        style={{
+                          opacity: String(0.42 + proximityToFocus * 0.5),
+                          strokeWidth: String(4.4 + proximityToFocus * 1.2),
+                        }}
                       />
                     )
                   })}
@@ -1418,7 +1703,7 @@ function App() {
                   />
                 </label>
                 <label>
-                  Iterations
+                  Iterations / step
                   <input
                     type="number"
                     min="1"
@@ -1526,23 +1811,19 @@ function App() {
               Simulation auto-play delay: {playbackMs} ms/frame
               <input
                 type="number"
-                min="120"
-                max="1200"
-                step="20"
+                min="1"
+                max="5000"
+                step="1"
                 value={playbackMs}
-                onChange={(event) =>
-                  setPlaybackMs(
-                    Math.min(1200, Math.max(120, Number(event.target.value) || 120)),
-                  )
-                }
+                onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
               />
               <input
                 type="range"
-                min="120"
-                max="1200"
-                step="20"
+                min="1"
+                max="5000"
+                step="1"
                 value={playbackMs}
-                onChange={(event) => setPlaybackMs(Number(event.target.value))}
+                onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
               />
             </label>
 
@@ -1612,96 +1893,83 @@ function App() {
                 </ReactFlow>
               </div>
             </div>
-
-            <div className="mcts-rollout-panel astar-detail-panel">
-              <div className="mcts-rollout-copy">
-                <h4>Live A* Metrics</h4>
-                <p className="explanation-text">
-                  Blue marks the active expansion, orange marks queued leaf nodes, and gray marks
-                  branches that were pruned or already expanded.
-                </p>
-                <div className="mcts-metric-grid">
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Current state</span>
-                    <strong>{displayedAStarFrame.current ?? '(none)'}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Queued leaves</span>
-                    <strong>{displayedAStarFrame.openSet.length}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Expected turns g</span>
-                    <strong>{formatAStarScore(astarCurrentScores?.g ?? null)}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Heuristic h</span>
-                    <strong>{astarCurrentScores?.h ?? '-'}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Expected total f</span>
-                    <strong>{formatAStarScore(astarCurrentScores?.f ?? null)}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Neighbor under test</span>
-                    <strong>{displayedAStarFrame.neighbor ?? '(none)'}</strong>
-                  </div>
-                </div>
-              </div>
-              <MiniBoardState
-                tile={displayedAStarFrame.current ?? visibleTile}
-                path={displayedAStarFrame.pathPreview.length > 0 ? displayedAStarFrame.pathPreview : [visibleTile]}
-                emphasisTile={displayedAStarFrame.current ?? visibleTile}
-                goalTile={goalTile}
-                size={148}
-                className="mcts-rollout-board"
-              />
-            </div>
           </section>
         )}
 
-        {displayedMCTSFrame && (
+        {currentMCTSFrame && (
           <section className="card full-span-card">
             <div className="mcts-visualization-header">
               <div className="section-heading">
-                <h2>MCTS Tree View</h2>
+                <h2>MCTS Current Simulation Graph</h2>
                 <p>
-                  The full search tree is laid out by depth, with the active node highlighted and
-                  enough spacing to make rollout structure easier to scan. Nodes are states (board
-                  positions); edges are actions and are labeled with the action taken.
+                  The graph follows the currently visible MCTS step in playback and automatically
+                  advances as new steps are shown. Use the buttons to review earlier or later saved
+                  search steps when playback is paused.
                 </p>
               </div>
               <div className="mcts-tree-summary">
                 <span>
-                  <strong>Phase</strong>: {displayedMCTSFrame.phase}
+                  <strong>Planning step</strong>:{' '}
+                  {(displayedMCTSFrame?.decisionStep ?? currentMCTSFrame.decisionStep) + 1}
                 </span>
                 <span>
-                  <strong>Iteration</strong>: {displayedMCTSFrame.iteration}
+                  <strong>Phase</strong>: {displayedMCTSFrame?.phase ?? currentMCTSFrame.phase}
                 </span>
                 <span>
-                  <strong>Best root action</strong>: {displayedMCTSFrame.bestRootAction ?? '(none yet)'}
+                  <strong>Iteration</strong>: {displayedMCTSFrame?.iteration ?? currentMCTSFrame.iteration}
                 </span>
                 <span>
-                  <strong>UCB c</strong>: {displayedMCTSFrame.explorationConstant.toFixed(3)}
+                  <strong>Best root action</strong>:{' '}
+                  {displayedMCTSFrame?.bestRootAction ?? currentMCTSFrame.bestRootAction ?? '(none yet)'}
                 </span>
                 <span>
-                  <strong>Gamma</strong>: {displayedMCTSFrame.gamma.toFixed(3)}
+                  <strong>UCB c</strong>:{' '}
+                  {(displayedMCTSFrame?.explorationConstant ?? currentMCTSFrame.explorationConstant).toFixed(3)}
+                </span>
+                <span>
+                  <strong>Gamma</strong>:{' '}
+                  {(displayedMCTSFrame?.gamma ?? currentMCTSFrame.gamma).toFixed(3)}
                 </span>
               </div>
             </div>
 
+            {mctsGraphHistory.length > 0 && (
+              <div className="history-nav-row">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={goToPreviousHistoricalGraph}
+                  disabled={!canViewPreviousHistoricalGraph}
+                >
+                  Previous Search Step
+                </button>
+                <span className="history-nav-status">
+                  Search step {(selectedHistoricalMCTSGraphIndex ?? 0) + 1} / {mctsGraphHistory.length}
+                </span>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={goToNextHistoricalGraph}
+                  disabled={!canViewNextHistoricalGraph}
+                >
+                  Next Search Step
+                </button>
+              </div>
+            )}
+
             <div className="tree-panel">
               <div className="mcts-flow">
                 <ReactFlow
-                  nodes={mctsTreeDiagram.nodes}
-                  edges={mctsTreeDiagram.edges}
+                  nodes={currentMCTSTreeDiagram.nodes}
+                  edges={currentMCTSTreeDiagram.edges}
                   nodeTypes={searchNodeTypes}
                   fitView
-                  fitViewOptions={{ padding: 0.18 }}
+                  fitViewOptions={{ padding: currentMCTSTreeDiagram.fitViewPadding }}
                   nodesDraggable={false}
                   nodesConnectable={false}
                   elementsSelectable={false}
                   zoomOnDoubleClick={false}
-                  minZoom={0.25}
+                  minZoom={currentMCTSTreeDiagram.minZoom}
                   maxZoom={1.5}
                   proOptions={{ hideAttribution: true }}
                 >
@@ -1709,41 +1977,6 @@ function App() {
                   <Controls showInteractive={false} position="top-right" />
                 </ReactFlow>
               </div>
-            </div>
-
-            <div className="mcts-rollout-panel">
-              <div className="mcts-rollout-copy">
-                <h4>Live Simulation Board</h4>
-                <p className="explanation-text">
-                  This board replays the currently visible selection or rollout path frame by frame.
-                </p>
-                <div className="mcts-metric-grid">
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Phase</span>
-                    <strong>{displayedMCTSFrame.phase}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Simulations run</span>
-                    <strong>{displayedMCTSFrame.iteration}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Current focus</span>
-                    <strong>{mctsPlaybackFocusTile}</strong>
-                  </div>
-                  <div className="mcts-metric-card">
-                    <span className="mcts-metric-label">Displayed path length</span>
-                    <strong>{mctsPlaybackTiles.length}</strong>
-                  </div>
-                </div>
-              </div>
-              <MiniBoardState
-                tile={mctsPlaybackFocusTile}
-                path={mctsPlaybackTiles}
-                emphasisTile={mctsPlaybackFocusTile}
-                goalTile={goalTile}
-                size={148}
-                className="mcts-rollout-board"
-              />
             </div>
           </section>
         )}
