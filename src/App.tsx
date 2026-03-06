@@ -813,7 +813,7 @@ function App() {
   const [mctsIterations, setMctsIterations] = useState(40)
   const [mctsExplorationC, setMctsExplorationC] = useState(Math.SQRT2)
   const [mctsGamma, setMctsGamma] = useState(0.9)
-  const [mctsHorizon, setMctsHorizon] = useState(10)
+  const [mctsHorizon, setMctsHorizon] = useState(100)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
   const tokenAnimationCounterRef = useRef(0)
   const tokenAnimationTimerRef = useRef<number | null>(null)
@@ -961,12 +961,12 @@ function App() {
 
   const performStep = useCallback(
     (action: Action) => {
-      const sampledTransition = sampleTransition(currentTile, action)
+      const sampledTransition = sampleTransition(currentTile, action, Math.random, goalTile)
 
       animateTokenMove(currentTile, sampledTransition.destination, action)
       setCurrentTile(sampledTransition.destination)
     },
-    [animateTokenMove, currentTile],
+    [animateTokenMove, currentTile, goalTile],
   )
 
   useEffect(() => {

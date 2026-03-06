@@ -175,26 +175,34 @@ export function getRandomStartTile(rng: () => number = Math.random) {
   return ALL_TILES[randomIndex]
 }
 
-export function transitionForAction(tile: TileId, action: Action) {
+function getAbsorbingExplanation(tile: TileId, goalTile?: TileId) {
+  if (goalTile && tile === goalTile) {
+    return `Goal tiles are absorbing, so ${tile} keeps you there forever.`
+  }
+
+  return `Trap tiles are absorbing, so ${tile} keeps you there forever.`
+}
+
+export function transitionForAction(tile: TileId, action: Action, goalTile?: TileId) {
   const tileType = getTileType(tile)
 
-  if (tileType === 'T') {
-    const trapExplanation = `Trap tiles are absorbing, so ${tile} keeps you there forever.`
+  if (tileType === 'T' || (goalTile && tile === goalTile)) {
+    const absorbingExplanation = getAbsorbingExplanation(tile, goalTile)
 
     return {
       branches: [
         {
-          label: 'trap',
+          label: tileType === 'T' ? 'trap' : 'goal',
           probability: 1,
           destination: tile,
-          explanation: trapExplanation,
+          explanation: absorbingExplanation,
         },
       ],
       outcomes: [
         {
           destination: tile,
           probability: 1,
-          explanation: trapExplanation,
+          explanation: absorbingExplanation,
         },
       ],
     }
@@ -239,8 +247,8 @@ export function transitionForAction(tile: TileId, action: Action) {
   }
 }
 
-export function sampleTransition(tile: TileId, action: Action, rng: () => number = Math.random) {
-  const transition = transitionForAction(tile, action)
+export function sampleTransition(tile: TileId, action: Action, rng: () => number = Math.random, goalTile?: TileId) {
+  const transition = transitionForAction(tile, action, goalTile)
   const randomValue = rng()
   let cumulativeProbability = 0
 
@@ -262,8 +270,8 @@ export function sampleTransition(tile: TileId, action: Action, rng: () => number
   }
 }
 
-export function expectedTurnsForDestination(tile: TileId, action: Action, destination: TileId) {
-  const probability = transitionForAction(tile, action).outcomes.reduce((total, outcome) => {
+export function expectedTurnsForDestination(tile: TileId, action: Action, destination: TileId, goalTile?: TileId) {
+  const probability = transitionForAction(tile, action, goalTile).outcomes.reduce((total, outcome) => {
     if (outcome.destination !== destination) {
       return total
     }
@@ -278,11 +286,11 @@ export function expectedTurnsForDestination(tile: TileId, action: Action, destin
   return 1 / probability
 }
 
-export function deterministicTransition(tile: TileId, action: Action): MoveAttempt {
-  if (getTileType(tile) === 'T') {
+export function deterministicTransition(tile: TileId, action: Action, goalTile?: TileId): MoveAttempt {
+  if (getTileType(tile) === 'T' || (goalTile && tile === goalTile)) {
     return {
       destination: tile,
-      explanation: `Trap tiles are absorbing, so ${tile} keeps you there forever.`,
+      explanation: getAbsorbingExplanation(tile, goalTile),
     }
   }
 

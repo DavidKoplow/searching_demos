@@ -346,8 +346,8 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
     })
 
     for (const action of ACTIONS) {
-      const neighbor = deterministicTransition(current, action).destination
-      const stepCost = expectedTurnsForDestination(current, action, neighbor)
+      const neighbor = deterministicTransition(current, action, goal).destination
+      const stepCost = expectedTurnsForDestination(current, action, neighbor, goal)
       const tentativeG = (gScore[current] ?? Number.POSITIVE_INFINITY) + stepCost
 
       pushFrame({
@@ -688,7 +688,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
     if (current.untriedActions.length > 0) {
       const actionIndex = Math.floor(rng() * current.untriedActions.length)
       const [action] = current.untriedActions.splice(actionIndex, 1)
-      const nextState = sampleTransition(current.tile, action, rng).destination
+      const nextState = sampleTransition(current.tile, action, rng, goal).destination
       const child: InternalMCTSNode = {
         id: nextNodeId++,
         tile: nextState,
@@ -723,7 +723,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
         break
       }
       const action = ACTIONS[Math.floor(rng() * ACTIONS.length)]
-      rolloutState = sampleTransition(rolloutState, action, rng).destination
+      rolloutState = sampleTransition(rolloutState, action, rng, goal).destination
       rolloutTiles.push(rolloutState)
     }
 
