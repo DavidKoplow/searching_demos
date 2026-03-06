@@ -137,7 +137,11 @@ function getMiniPoint(tile: TileId, size = 80) {
   }
 }
 
-function getMiniTileFill(tile: TileId) {
+function getMiniTileFill(tile: TileId, goalTile?: TileId) {
+  if (goalTile && tile === goalTile) {
+    return '#dcfce7'
+  }
+
   const tileType = getTileType(tile)
 
   if (tileType === 'S') {
@@ -191,6 +195,7 @@ function MiniBoardState({
   emphasisTile,
   simulationPath = [],
   simulationIndicatorToTile = null,
+  goalTile,
   size = 88,
   className = '',
 }: {
@@ -199,6 +204,7 @@ function MiniBoardState({
   emphasisTile?: TileId
   simulationPath?: TileId[]
   simulationIndicatorToTile?: TileId | null
+  goalTile?: TileId
   size?: number
   className?: string
 }) {
@@ -231,7 +237,7 @@ function MiniBoardState({
                 width={cellSize}
                 height={cellSize}
                 rx="4"
-                fill={getMiniTileFill(tileId)}
+                fill={getMiniTileFill(tileId, goalTile)}
                 stroke="#90a0ba"
                 strokeWidth="1"
               />
@@ -363,6 +369,7 @@ type MCTSFlowNodeData = {
   transitionPath: TileId[]
   simulationPath: TileId[]
   simulationIndicatorToTile: TileId | null
+  goalTile: TileId
 }
 
 type AStarRenderNodeStatus = AStarTreeNodeSnapshot['status'] | 'rejected'
@@ -384,6 +391,7 @@ type AStarFlowNodeData = {
   mode: 'astar'
   snapshot: AStarRenderNodeSnapshot
   previewPath: TileId[]
+  goalTile: TileId
 }
 
 type SearchFlowNodeData = MCTSFlowNodeData | AStarFlowNodeData
@@ -430,6 +438,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
           emphasisTile={node.tile}
           simulationPath={data.simulationPath}
           simulationIndicatorToTile={data.simulationIndicatorToTile}
+          goalTile={data.goalTile}
           size={SEARCH_NODE_BOARD_SIZE}
         />
         <div className="tree-node-stats">
@@ -454,6 +463,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
         tile={data.snapshot.tile}
         path={data.previewPath}
         emphasisTile={data.snapshot.tile}
+        goalTile={data.goalTile}
         size={SEARCH_NODE_BOARD_SIZE}
       />
       <div className="tree-node-stats">
@@ -467,7 +477,7 @@ function SearchFlowNodeCard({ data }: NodeProps<SearchFlowNodeType>) {
   )
 }
 
-function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number, TileId[]>) {
+function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number, TileId[]>, goalTile: TileId) {
   const { tree, activeNodeId } = frame
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
@@ -508,11 +518,15 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
 
   dagre.layout(graph)
   const nodeById = new Map(orderedTree.map((node) => [node.id, node] as const))
+  const currentRolloutLeafId =
+    frame.selectionPathIds.length > 0 ? frame.selectionPathIds[frame.selectionPathIds.length - 1] : null
 
   const nodes: SearchFlowNodeType[] = orderedTree.map((node) => {
     const position = graph.node(String(node.id))
     const parentTile = node.parentId === null ? null : nodeById.get(node.parentId)?.tile ?? null
-    const simulationPath = rolloutPathByNodeId.get(node.id) ?? []
+    const simulationPath =
+      rolloutPathByNodeId.get(node.id) ??
+      (currentRolloutLeafId === node.id && frame.rolloutTiles.length > 0 ? frame.rolloutTiles : [])
     const simulationIndicatorToTile = simulationPath[1] ?? null
 
     return {
@@ -525,6 +539,7 @@ function buildMCTSTreeDiagram(frame: MCTSFrame, rolloutPathByNodeId: Map<number,
         transitionPath: parentTile ? [parentTile, node.tile] : [node.tile],
         simulationPath,
         simulationIndicatorToTile,
+        goalTile,
       },
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
@@ -598,7 +613,7 @@ function buildAStarTreePath(nodeId: string, nodeById: Map<string, AStarRenderNod
   return path
 }
 
-function buildAStarNavigationDiagram(frame: AStarFrame) {
+function buildAStarNavigationDiagram(frame: AStarFrame, goalTile: TileId) {
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
   graph.setGraph({
@@ -695,6 +710,7 @@ function buildAStarNavigationDiagram(frame: AStarFrame) {
         mode: 'astar',
         snapshot: node,
         previewPath: buildAStarTreePath(node.id, nodeById),
+        goalTile,
       },
       draggable: false,
       selectable: false,
@@ -867,22 +883,22 @@ function App() {
   const mctsTreeDiagram = useMemo(
     () =>
       displayedMCTSFrame
-        ? buildMCTSTreeDiagram(displayedMCTSFrame, mctsRolloutPathByNodeId)
+        ? buildMCTSTreeDiagram(displayedMCTSFrame, mctsRolloutPathByNodeId, goalTile)
         : {
             nodes: [] as SearchFlowNodeType[],
             edges: [] as Edge[],
           },
-    [displayedMCTSFrame, mctsRolloutPathByNodeId],
+    [displayedMCTSFrame, goalTile, mctsRolloutPathByNodeId],
   )
   const astarGraphDiagram = useMemo(
     () =>
       displayedAStarFrame
-        ? buildAStarNavigationDiagram(displayedAStarFrame)
+        ? buildAStarNavigationDiagram(displayedAStarFrame, goalTile)
         : {
             nodes: [] as SearchFlowNodeType[],
             edges: [] as Edge[],
           },
-    [displayedAStarFrame],
+    [displayedAStarFrame, goalTile],
   )
   const searchNodeTypes = useMemo(() => ({ searchNode: SearchFlowNodeCard }), [])
   const displayedMCTSSelectionTiles = displayedMCTSFrame ? getSelectionTiles(displayedMCTSFrame) : []
@@ -1553,6 +1569,7 @@ function App() {
                 tile={displayedAStarFrame.current ?? visibleTile}
                 path={displayedAStarFrame.pathPreview.length > 0 ? displayedAStarFrame.pathPreview : [visibleTile]}
                 emphasisTile={displayedAStarFrame.current ?? visibleTile}
+                goalTile={goalTile}
                 size={148}
                 className="mcts-rollout-board"
               />
@@ -1640,6 +1657,7 @@ function App() {
                 tile={mctsPlaybackFocusTile}
                 path={mctsPlaybackTiles}
                 emphasisTile={mctsPlaybackFocusTile}
+                goalTile={goalTile}
                 size={148}
                 className="mcts-rollout-board"
               />
