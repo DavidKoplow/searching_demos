@@ -65,6 +65,65 @@ type TokenAnimation = {
 
 type DemoFrame = AStarFrame | MCTSFrame | ExecutionFrame
 
+type AlgorithmTraceLine = {
+  id: string
+  text: string
+  indent?: number
+}
+
+type AlgorithmTraceValue = {
+  label: string
+  value: string
+}
+
+type AlgorithmTraceModel = {
+  algorithmLabel: string
+  frameMessage: string
+  activeLineId: string
+  /** When active line is the body of a conditional, the conditional line id (shown blue; child shown lighter). */
+  activeParentLineId?: string
+  lines: AlgorithmTraceLine[]
+  values: AlgorithmTraceValue[]
+}
+
+type AlgorithmTraceControl = {
+  label: string
+  value: string
+  onPrevious: () => void
+  onNext: () => void
+  canPrevious: boolean
+  canNext: boolean
+}
+
+const ASTAR_TRACE_LINES: AlgorithmTraceLine[] = [
+  { id: 'init', text: 'openSet <- { start }' },
+  { id: 'loop', text: 'while openSet is not empty:' },
+  { id: 'expand', text: 'current <- node in openSet with smallest f = g + h', indent: 1 },
+  { id: 'goal-check', text: 'if current is goal:', indent: 1 },
+  { id: 'goal', text: 'return path(current)', indent: 2 },
+  { id: 'goal-else', text: 'else:', indent: 1 },
+  { id: 'consider', text: 'for each neighbor of current:', indent: 2 },
+  { id: 'skip-check', text: 'if neighbor is closed or not better:', indent: 3 },
+  { id: 'skip', text: 'continue', indent: 4 },
+  { id: 'skip-else', text: 'else:', indent: 3 },
+  { id: 'update', text: 'update parent, g, h, and f', indent: 4 },
+  { id: 'update-queue', text: 'keep neighbor in openSet', indent: 4 },
+  { id: 'finish', text: 'return failure if no path is found' },
+]
+
+const MCTS_TRACE_LINES: AlgorithmTraceLine[] = [
+  { id: 'init', text: 'root <- current state' },
+  { id: 'loop', text: 'for iteration = 1 to planningBudget:' },
+  { id: 'selection', text: 'select children by UCB until a leaf is reached', indent: 1 },
+  { id: 'expansion-check', text: 'if leaf has an untried action:', indent: 1 },
+  { id: 'expansion', text: 'expand one child', indent: 2 },
+  { id: 'expansion-else', text: 'else:', indent: 1 },
+  { id: 'rollout', text: 'simulate a rollout from the new state', indent: 2 },
+  { id: 'backprop', text: 'backpropagate reward through visited nodes', indent: 1 },
+  { id: 'iteration-end', text: 'update best root action from visit counts', indent: 1 },
+  { id: 'finished', text: 'return root action with the most visits' },
+]
+
 function isAStarFrame(frame: DemoFrame | null): frame is AStarFrame {
   return frame?.kind === 'astar'
 }
@@ -1048,6 +1107,250 @@ function getFrameTile(frame: DemoFrame | null, fallback: TileId) {
   return fallback
 }
 
+function formatTraceList<T>(
+  values: T[],
+  formatter: (value: T) => string = (value) => String(value),
+  limit = 6,
+) {
+  if (values.length === 0) {
+    return '(empty)'
+  }
+
+  const visibleValues = values.slice(0, limit).map(formatter)
+  const remainder = values.length - visibleValues.length
+
+  return remainder > 0
+    ? `${visibleValues.join(', ')} ... (+${remainder})`
+    : visibleValues.join(', ')
+}
+
+function formatAStarScorePreview(frame: AStarFrame) {
+  const visibleRows = frame.scoreRows
+    .filter((row) => row.f !== null)
+    .sort((left, right) => (left.f ?? Number.POSITIVE_INFINITY) - (right.f ?? Number.POSITIVE_INFINITY))
+    .slice(0, 4)
+    .map((row) => `${row.tile}(g=${row.g}, h=${row.h}, f=${row.f})`)
+
+  return visibleRows.length > 0 ? visibleRows.join(' | ') : '(none yet)'
+}
+
+function getAStarTraceLineId(frame: AStarFrame) {
+  switch (frame.phase) {
+    case 'init':
+      return 'init'
+    case 'loop':
+      return 'loop'
+    case 'expand':
+      return 'expand'
+    case 'consider-neighbor':
+      return 'consider'
+    case 'update-neighbor':
+      return 'update'
+    case 'update-queue':
+      return 'update-queue'
+    case 'skip-neighbor':
+      return 'skip'
+    case 'goal-found':
+      return 'goal'
+    case 'finished':
+      return frame.reachedGoal ? 'goal' : 'finish'
+    default:
+      return 'loop'
+  }
+}
+
+/** When the active line is a conditional body (then or else), return the parent line id (if/else) so both can be highlighted. */
+function getAStarTraceParentLineId(frame: AStarFrame): string | undefined {
+  switch (frame.phase) {
+    case 'goal-found':
+      return 'goal-check'
+    case 'consider-neighbor':
+      return 'goal-else'
+    case 'skip-neighbor':
+      return 'skip-check'
+    case 'update-neighbor':
+    case 'update-queue':
+      return 'skip-else'
+    default:
+      return undefined
+  }
+}
+
+function getMCTSTraceLineId(frame: MCTSFrame) {
+  switch (frame.phase) {
+    case 'init':
+      return 'init'
+    case 'loop':
+      return 'loop'
+    case 'selection':
+      return 'selection'
+    case 'expansion':
+      return 'expansion'
+    case 'expansion-else':
+      return 'expansion-else'
+    case 'rollout':
+      return 'rollout'
+    case 'backprop':
+      return 'backprop'
+    case 'iteration-end':
+      return 'iteration-end'
+    case 'finished':
+      return 'finished'
+    default:
+      return 'loop'
+  }
+}
+
+/** When the active line is a conditional body (expansion, expansion-else, or rollout), return the parent line id so both can be highlighted. */
+function getMCTSTraceParentLineId(frame: MCTSFrame): string | undefined {
+  switch (frame.phase) {
+    case 'expansion':
+      return 'expansion-check'
+    case 'expansion-else':
+      return 'expansion-check'
+    case 'rollout':
+      return 'expansion-else'
+    default:
+      return undefined
+  }
+}
+
+function buildAStarTraceModel(frame: AStarFrame): AlgorithmTraceModel {
+  return {
+    algorithmLabel: 'A* Pseudocode',
+    frameMessage: frame.message,
+    activeLineId: getAStarTraceLineId(frame),
+    activeParentLineId: getAStarTraceParentLineId(frame),
+    lines: ASTAR_TRACE_LINES,
+    values: [
+      { label: 'Frame', value: String(frame.step) },
+      { label: 'Step', value: String(frame.step) },
+      { label: 'Phase', value: frame.phase },
+      { label: 'Current', value: frame.current ?? '(none)' },
+      { label: 'Action', value: frame.action ? describeAction(frame.action) : '(none)' },
+      { label: 'Neighbor', value: frame.neighbor ?? '(none)' },
+      { label: 'Open set', value: formatTraceList(frame.openSet) },
+      { label: 'Closed set', value: formatTraceList(frame.closedSet) },
+      { label: 'Path preview', value: formatTraceList(frame.pathPreview) },
+      { label: 'Best scores', value: formatAStarScorePreview(frame) },
+    ],
+  }
+}
+
+function buildMCTSTraceModel(frame: MCTSFrame): AlgorithmTraceModel {
+  return {
+    algorithmLabel: 'MCTS Pseudocode',
+    frameMessage: frame.message,
+    activeLineId: getMCTSTraceLineId(frame),
+    activeParentLineId: getMCTSTraceParentLineId(frame),
+    lines: MCTS_TRACE_LINES,
+    values: [
+      { label: 'Frame', value: String(frame.step) },
+      { label: 'Step', value: String(frame.step) },
+      { label: 'Decision step', value: String(frame.decisionStep + 1) },
+      { label: 'Iteration', value: String(frame.iteration) },
+      { label: 'Phase', value: frame.phase },
+      { label: 'Active node', value: frame.activeNodeId === null ? '(none)' : `#${frame.activeNodeId}` },
+      {
+        label: 'Selection path',
+        value: formatTraceList(frame.selectionPathIds, (nodeId) => `#${nodeId}`),
+      },
+      { label: 'Rollout tiles', value: formatTraceList(frame.rolloutTiles) },
+      { label: 'Best root action', value: frame.bestRootAction ? describeAction(frame.bestRootAction) : '(none yet)' },
+      { label: 'Best root visits', value: String(frame.bestRootVisits) },
+      { label: 'Tree nodes', value: String(frame.tree.length) },
+    ],
+  }
+}
+
+function AlgorithmTracePanel({
+  trace,
+  controls = [],
+  variant = 'astar',
+}: {
+  trace: AlgorithmTraceModel
+  controls?: AlgorithmTraceControl[]
+  variant?: 'astar' | 'mcts'
+}) {
+  const controlsByLabel = new Map(controls.map((control) => [control.label, control] as const))
+
+  return (
+    <aside
+      className={`algorithm-trace-panel${variant === 'mcts' ? ' algorithm-trace-panel-mcts' : ''}`}
+      aria-label={`${trace.algorithmLabel} trace`}
+    >
+      <div className="algorithm-trace-header">
+        <p className="algorithm-trace-eyebrow">Algorithm Trace</p>
+        <h3>{trace.algorithmLabel}</h3>
+        <p className="algorithm-trace-message">{trace.frameMessage}</p>
+      </div>
+
+      <ol
+        className={`algorithm-trace-lines${trace.activeParentLineId ? ' algorithm-trace-lines-has-parent' : ''}`}
+      >
+        {trace.lines.map((line, index) => {
+          const isActive = line.id === trace.activeLineId
+          const isActiveParent = line.id === trace.activeParentLineId
+
+          const isRolloutHighlight =
+            variant === 'mcts' && line.id === 'rollout' && (isActive || isActiveParent)
+
+          return (
+            <li
+              key={line.id}
+              className={`algorithm-trace-line${isActive ? ' algorithm-trace-line-active' : ''}${isActiveParent ? ' algorithm-trace-line-active-parent' : ''}${isRolloutHighlight ? ' algorithm-trace-line-rollout' : ''}`}
+              style={line.indent ? { marginLeft: `${line.indent * 16}px` } : undefined}
+            >
+              <span className="algorithm-trace-line-number">{index + 1}</span>
+              <span className="algorithm-trace-line-text">{line.text}</span>
+            </li>
+          )
+        })}
+      </ol>
+
+      <dl className="algorithm-trace-values">
+        {trace.values.map((entry) => (
+          <Fragment key={entry.label}>
+            <dt>{entry.label}</dt>
+            <dd>
+              {controlsByLabel.has(entry.label) ? (
+                <div
+                  className="algorithm-trace-stepper"
+                  aria-label={`${controlsByLabel.get(entry.label)!.label} navigation`}
+                >
+                  <button
+                    className="algorithm-trace-stepper-button"
+                    type="button"
+                    onClick={controlsByLabel.get(entry.label)!.onPrevious}
+                    disabled={!controlsByLabel.get(entry.label)!.canPrevious}
+                    aria-label={`Previous ${controlsByLabel.get(entry.label)!.label.toLowerCase()}`}
+                  >
+                    {'<'}
+                  </button>
+                  <span className="algorithm-trace-stepper-value">
+                    {controlsByLabel.get(entry.label)!.value}
+                  </span>
+                  <button
+                    className="algorithm-trace-stepper-button"
+                    type="button"
+                    onClick={controlsByLabel.get(entry.label)!.onNext}
+                    disabled={!controlsByLabel.get(entry.label)!.canNext}
+                    aria-label={`Next ${controlsByLabel.get(entry.label)!.label.toLowerCase()}`}
+                  >
+                    {'>'}
+                  </button>
+                </div>
+              ) : (
+                entry.value
+              )}
+            </dd>
+          </Fragment>
+        ))}
+      </dl>
+    </aside>
+  )
+}
+
 function App() {
   const [currentTile, setCurrentTile] = useState<TileId>(() => getRandomStartTile())
   const [algorithm, setAlgorithm] = useState<AlgorithmKind>('astar')
@@ -1117,6 +1420,14 @@ function App() {
     isMCTSFrame(activeFrame) && activeMCTSGraphIndex === selectedHistoricalMCTSGraphIndex
       ? activeFrame
       : displayedHistoricalMCTSHistoryEntry?.frame ?? currentMCTSFrame
+  const astarTrace = useMemo(
+    () => (displayedAStarFrame ? buildAStarTraceModel(displayedAStarFrame) : null),
+    [displayedAStarFrame],
+  )
+  const mctsTrace = useMemo(
+    () => (displayedMCTSFrame ? buildMCTSTraceModel(displayedMCTSFrame) : null),
+    [displayedMCTSFrame],
+  )
   const displayedMCTSRolloutPathByNodeId = useMemo(() => {
     if (isMCTSFrame(activeFrame) && activeMCTSGraphIndex === selectedHistoricalMCTSGraphIndex) {
       const currentStepFrames = demoFrames
@@ -1164,6 +1475,14 @@ function App() {
   const canViewNextHistoricalGraph =
     selectedHistoricalMCTSGraphIndex !== null &&
     selectedHistoricalMCTSGraphIndex < mctsGraphHistory.length - 1
+  const goToPreviousFrame = useCallback(() => {
+    setIsAutoPlay(false)
+    setDemoIndex((index) => Math.max(0, index - 1))
+  }, [])
+  const goToNextFrame = useCallback(() => {
+    setIsAutoPlay(false)
+    setDemoIndex((index) => Math.min(index + 1, demoFrames.length - 1))
+  }, [demoFrames.length])
 
   const clearTokenAnimation = useCallback(() => {
     if (tokenAnimationTimerRef.current !== null) {
@@ -1445,39 +1764,23 @@ function App() {
 
   return (
     <main className="app-shell">
-      <section className="hero card">
-        <p className="eyebrow">Text RPG visualizer</p>
-        <h1>Dungeon Crawler</h1>
-        <ul className="hero-rules">
-          <li>The room is a 3x6 grid with rows 1-3 and columns A-F.</li>
-          <li>You start at time 0 on a uniformly random tile.</li>
-          <li>
-            In this interactive version, you choose an action each step: up, down,
-            left, or right.
-          </li>
-          <li>
-            Normal tiles (<strong>N</strong>) follow the chosen action.
-          </li>
-          <li>
-            Stuck tiles (<strong>S</strong>) have a 50% chance to keep you in place;
-            otherwise they follow the chosen action.
-          </li>
-          <li>
-            Trap tiles (<strong>T</strong>) are absorbing, so once entered you never
-            leave.
-          </li>
-          <li>
-            If a move hits a wall, including the special walls around <strong>2A</strong> and
-            the corridor walls in the right half, you stay in the same tile for that time step.
-          </li>
-          <li>
-            Your observation is only the type of tile you are currently standing on:
-            <strong> N</strong>, <strong>S</strong>, or <strong>T</strong>.
-          </li>
-        </ul>
-      </section>
+      <div className="layout">
+        <section className="hero card">
+          <p className="eyebrow">Text RPG visualizer</p>
+          <h1>Dungeon Crawler</h1>
+          <ul className="hero-rules">
+            <li>3×6 grid (rows 1–3, columns A–F). Start on a random tile.</li>
+            <li>Each step: choose up, down, left, or right.</li>
+            <li>
+              <strong>N</strong>: move as chosen. <strong>S</strong>: 50% stay, else move. <strong>T</strong>: absorbing (never leave).
+            </li>
+            <li>
+              <strong>Goal</strong>: reaching the goal tile is absorbing (you win and stay).
+            </li>
+            <li>Wall hits: stay in place. Observe only current tile type: N, S, or T.</li>
+          </ul>
+        </section>
 
-      <section className="layout">
         <div className="card board-card">
           <div className="section-heading">
             <h2>Room Map</h2>
@@ -1525,7 +1828,6 @@ function App() {
                       key={tileId}
                     >
                       <span className="cell-id">{tileId}</span>
-                      <span className="cell-type">{isGoal ? 'G' : tileType}</span>
                       {scoreRow && (scoreRow.g !== null || scoreRow.f !== null) && (
                         <span className="cell-score">
                           g:{scoreRow.g ?? '-'} h:{scoreRow.h} f:{scoreRow.f ?? '-'}
@@ -1659,238 +1961,187 @@ function App() {
 
         </div>
 
-        <div className="sidebar">
-          <section className="card">
-            <div className="section-heading">
-              <h2>Algorithm Demo</h2>
-              <p>Compute timeline first, then execution timeline.</p>
-            </div>
+        <section className="card settings-card">
+          <div className="section-heading">
+            <h2>Controls</h2>
+            <p>Compute timeline first, then execution timeline.</p>
+          </div>
 
-            <div className="control-grid">
-              <label>
-                Algorithm
-                <select
-                  value={algorithm}
-                  onChange={(event) => setAlgorithm(event.target.value as AlgorithmKind)}
-                >
-                  <option value="astar">A*</option>
-                  <option value="mcts">MCTS</option>
-                </select>
-              </label>
-
-              <label>
-                Goal tile
-                <select value={goalTile} onChange={(event) => setGoalTile(event.target.value as TileId)}>
-                  {allTiles.map((tile: TileId) => (
-                    <option key={tile} value={tile}>
-                      {tile}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            {algorithm === 'mcts' ? (
-              <div className="control-grid">
-                <label>
-                  UCT c
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.1"
-                    value={mctsExplorationC}
-                    onChange={(event) => setMctsExplorationC(Number(event.target.value) || 0)}
-                  />
-                </label>
-                <label>
-                  Iterations / step
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={mctsIterations}
-                    onChange={(event) => setMctsIterations(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
-                  />
-                </label>
-                <label>
-                  Horizon
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={mctsHorizon}
-                    onChange={(event) => setMctsHorizon(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
-                  />
-                </label>
-                <label>
-                  Gamma
-                  <input
-                    type="number"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={mctsGamma}
-                    onChange={(event) =>
-                      setMctsGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
-                    }
-                  />
-                </label>
-                <label>
-                  Goal reward
-                  <input
-                    type="number"
-                    value={mctsGoalReward}
-                    onChange={(event) => setMctsGoalReward(Number(event.target.value) || 0)}
-                  />
-                </label>
-                <label>
-                  Trap reward
-                  <input
-                    type="number"
-                    value={mctsTrapReward}
-                    onChange={(event) => setMctsTrapReward(Number(event.target.value) || 0)}
-                  />
-                </label>
-              </div>
-            ) : (
-              <p className="explanation-text">
-                A* uses expected turn cost for edge weights. A normal move costs 1 turn, while
-                leaving a stuck tile in the chosen direction costs 2 expected turns when the move
-                succeeds with probability 0.5.
-              </p>
-            )}
-
-            <div className="control-row">
-              <button className="primary-button" type="button" onClick={runAlgorithm}>
-                Start
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => {
-                  setIsAutoPlay(false)
-                  setDemoIndex(0)
-                }}
-                disabled={demoFrames.length === 0}
+          <div className="control-grid">
+            <label>
+              Algorithm
+              <select
+                value={algorithm}
+                onChange={(event) => setAlgorithm(event.target.value as AlgorithmKind)}
               >
-                Rewind
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => {
-                  setIsAutoPlay(false)
-                  setDemoIndex((index) => Math.max(0, index - 1))
-                }}
-                disabled={!canStepBack}
-              >
-                Step Back
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => {
-                  setIsAutoPlay(false)
-                  setDemoIndex((index) => Math.min(index + 1, demoFrames.length - 1))
-                }}
-                disabled={!canStepForward}
-              >
-                Step Forward
-              </button>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => setIsAutoPlay((value) => !value)}
-                disabled={demoFrames.length === 0}
-              >
-                {isAutoPlay ? 'Auto-play: On' : 'Auto-play: Off'}
-              </button>
-            </div>
-
-            <label className="speed-row">
-              Simulation auto-play delay: {playbackMs} ms/frame
-              <input
-                type="number"
-                min="1"
-                max="5000"
-                step="1"
-                value={playbackMs}
-                onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
-              />
-              <input
-                type="range"
-                min="1"
-                max="5000"
-                step="1"
-                value={playbackMs}
-                onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
-              />
+                <option value="astar">A*</option>
+                <option value="mcts">MCTS</option>
+              </select>
             </label>
 
-            {activeFrame ? (
-              <div className="probability-block">
-                <h3>
-                  Frame {demoIndex + 1} / {demoFrames.length}
-                </h3>
-                <p className="explanation-text">{activeFrame.message}</p>
-                <p className="explanation-text">
-                  Phase: <strong>{activeFrame.phase}</strong>
-                </p>
-              </div>
-            ) : (
-              <p className="empty-state">Press Start to begin stepping through the algorithm.</p>
-            )}
+            <label>
+              Goal tile
+              <select value={goalTile} onChange={(event) => setGoalTile(event.target.value as TileId)}>
+                {allTiles.map((tile: TileId) => (
+                  <option key={tile} value={tile}>
+                    {tile}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
 
-          </section>
+          {algorithm === 'mcts' && (
+            <div className="control-grid">
+              <label>
+                UCT c
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  value={mctsExplorationC}
+                  onChange={(event) => setMctsExplorationC(Number(event.target.value) || 0)}
+                />
+              </label>
+              <label>
+                Iterations / step
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={mctsIterations}
+                  onChange={(event) => setMctsIterations(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
+                />
+              </label>
+              <label>
+                Horizon
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={mctsHorizon}
+                  onChange={(event) => setMctsHorizon(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
+                />
+              </label>
+              <label>
+                Gamma
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={mctsGamma}
+                  onChange={(event) =>
+                    setMctsGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+              <label>
+                Goal reward
+                <input
+                  type="number"
+                  value={mctsGoalReward}
+                  onChange={(event) => setMctsGoalReward(Number(event.target.value) || 0)}
+                />
+              </label>
+              <label>
+                Trap reward
+                <input
+                  type="number"
+                  value={mctsTrapReward}
+                  onChange={(event) => setMctsTrapReward(Number(event.target.value) || 0)}
+                />
+              </label>
+            </div>
+          )}
 
-        </div>
+          <div className="control-row">
+            <button className="primary-button" type="button" onClick={runAlgorithm}>
+              Start
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => {
+                setIsAutoPlay(false)
+                setDemoIndex(0)
+              }}
+              disabled={demoFrames.length === 0}
+            >
+              Rewind
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => setIsAutoPlay((value) => !value)}
+              disabled={demoFrames.length === 0}
+            >
+              {isAutoPlay ? 'Auto-play: On' : 'Auto-play: Off'}
+            </button>
+          </div>
+
+          <label className="speed-row">
+            Simulation auto-play delay: {playbackMs} ms/frame
+            <input
+              type="number"
+              min="1"
+              max="5000"
+              step="1"
+              value={playbackMs}
+              onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
+            />
+            <input
+              type="range"
+              min="1"
+              max="5000"
+              step="1"
+              value={playbackMs}
+              onChange={(event) => setPlaybackMs(clampPlaybackMs(Number(event.target.value)))}
+            />
+          </label>
+
+        </section>
 
         {displayedAStarFrame && (
           <section className="card full-span-card">
-            <div className="mcts-visualization-header">
-              <div className="section-heading">
-                <h2>A* Navigation Graph</h2>
-                <p>
-                  One node per state; edges are actions and show the action label. The graph grows as
-                  A* discovers states, with each new node added as a leaf beneath the state that
-                  generated it.
-                </p>
-              </div>
-              <div className="mcts-tree-summary">
-                <span>
-                  <strong>Phase</strong>: {displayedAStarFrame.phase}
-                </span>
-                <span>
-                  <strong>Current</strong>: {displayedAStarFrame.current ?? '(none)'}
-                </span>
-                <span>
-                  <strong>Queued leaves</strong>: {displayedAStarFrame.openSet.length}
-                </span>
-                <span>
-                  <strong>Pruned</strong>: {displayedAStarFrame.closedSet.length}
-                </span>
-              </div>
-            </div>
-
-            <div className="tree-panel">
-              <div className="mcts-flow astar-flow">
-                <ReactFlow
-                  nodes={astarGraphDiagram.nodes}
-                  edges={astarGraphDiagram.edges}
-                  nodeTypes={searchNodeTypes}
-                  fitView
-                  fitViewOptions={{ padding: 0.18 }}
-                  nodesDraggable={false}
-                  nodesConnectable={false}
-                  elementsSelectable={false}
-                  zoomOnDoubleClick={false}
-                  minZoom={0.3}
-                  maxZoom={1.6}
-                  proOptions={{ hideAttribution: true }}
-                >
-                  <Background gap={24} color="#d9e1ee" />
-                  <Controls showInteractive={false} position="top-right" />
-                </ReactFlow>
+            <div className="tree-panel trace-tree-panel">
+              <div className="tree-panel-layout">
+                <div className="tree-flow-shell">
+                  <div className="mcts-flow astar-flow">
+                    <ReactFlow
+                      nodes={astarGraphDiagram.nodes}
+                      edges={astarGraphDiagram.edges}
+                      nodeTypes={searchNodeTypes}
+                      fitView
+                      fitViewOptions={{ padding: 0.18 }}
+                      nodesDraggable={false}
+                      nodesConnectable={false}
+                      elementsSelectable={false}
+                      zoomOnDoubleClick={false}
+                      minZoom={0.3}
+                      maxZoom={1.6}
+                      proOptions={{ hideAttribution: true }}
+                    >
+                      <Background gap={24} color="#d9e1ee" />
+                      <Controls showInteractive={false} position="top-right" />
+                    </ReactFlow>
+                  </div>
+                </div>
+                {astarTrace && (
+                  <AlgorithmTracePanel
+                    trace={astarTrace}
+                    controls={[
+                      {
+                        label: 'Frame',
+                        value: `${demoIndex + 1} / ${demoFrames.length}`,
+                        onPrevious: goToPreviousFrame,
+                        onNext: goToNextFrame,
+                        canPrevious: canStepBack,
+                        canNext: canStepForward,
+                      },
+                    ]}
+                  />
+                )}
               </div>
             </div>
           </section>
@@ -1898,89 +2149,62 @@ function App() {
 
         {currentMCTSFrame && (
           <section className="card full-span-card">
-            <div className="mcts-visualization-header">
-              <div className="section-heading">
-                <h2>MCTS Current Simulation Graph</h2>
-                <p>
-                  The graph follows the currently visible MCTS step in playback and automatically
-                  advances as new steps are shown. Use the buttons to review earlier or later saved
-                  search steps when playback is paused.
-                </p>
-              </div>
-              <div className="mcts-tree-summary">
-                <span>
-                  <strong>Planning step</strong>:{' '}
-                  {(displayedMCTSFrame?.decisionStep ?? currentMCTSFrame.decisionStep) + 1}
-                </span>
-                <span>
-                  <strong>Phase</strong>: {displayedMCTSFrame?.phase ?? currentMCTSFrame.phase}
-                </span>
-                <span>
-                  <strong>Iteration</strong>: {displayedMCTSFrame?.iteration ?? currentMCTSFrame.iteration}
-                </span>
-                <span>
-                  <strong>Best root action</strong>:{' '}
-                  {displayedMCTSFrame?.bestRootAction ?? currentMCTSFrame.bestRootAction ?? '(none yet)'}
-                </span>
-                <span>
-                  <strong>UCB c</strong>:{' '}
-                  {(displayedMCTSFrame?.explorationConstant ?? currentMCTSFrame.explorationConstant).toFixed(3)}
-                </span>
-                <span>
-                  <strong>Gamma</strong>:{' '}
-                  {(displayedMCTSFrame?.gamma ?? currentMCTSFrame.gamma).toFixed(3)}
-                </span>
-              </div>
-            </div>
-
-            {mctsGraphHistory.length > 0 && (
-              <div className="history-nav-row">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={goToPreviousHistoricalGraph}
-                  disabled={!canViewPreviousHistoricalGraph}
-                >
-                  Previous Search Step
-                </button>
-                <span className="history-nav-status">
-                  Search step {(selectedHistoricalMCTSGraphIndex ?? 0) + 1} / {mctsGraphHistory.length}
-                </span>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={goToNextHistoricalGraph}
-                  disabled={!canViewNextHistoricalGraph}
-                >
-                  Next Search Step
-                </button>
-              </div>
-            )}
-
-            <div className="tree-panel">
-              <div className="mcts-flow">
-                <ReactFlow
-                  nodes={currentMCTSTreeDiagram.nodes}
-                  edges={currentMCTSTreeDiagram.edges}
-                  nodeTypes={searchNodeTypes}
-                  fitView
-                  fitViewOptions={{ padding: currentMCTSTreeDiagram.fitViewPadding }}
-                  nodesDraggable={false}
-                  nodesConnectable={false}
-                  elementsSelectable={false}
-                  zoomOnDoubleClick={false}
-                  minZoom={currentMCTSTreeDiagram.minZoom}
-                  maxZoom={1.5}
-                  proOptions={{ hideAttribution: true }}
-                >
-                  <Background gap={24} color="#d9e1ee" />
-                  <Controls showInteractive={false} position="top-right" />
-                </ReactFlow>
+            <div className="tree-panel trace-tree-panel">
+              <div className="tree-panel-layout">
+                <div className="tree-flow-shell">
+                  <div className="mcts-flow">
+                    <ReactFlow
+                      nodes={currentMCTSTreeDiagram.nodes}
+                      edges={currentMCTSTreeDiagram.edges}
+                      nodeTypes={searchNodeTypes}
+                      fitView
+                      fitViewOptions={{ padding: currentMCTSTreeDiagram.fitViewPadding }}
+                      nodesDraggable={false}
+                      nodesConnectable={false}
+                      elementsSelectable={false}
+                      zoomOnDoubleClick={false}
+                      minZoom={currentMCTSTreeDiagram.minZoom}
+                      maxZoom={1.5}
+                      proOptions={{ hideAttribution: true }}
+                    >
+                      <Background gap={24} color="#d9e1ee" />
+                      <Controls showInteractive={false} position="top-right" />
+                    </ReactFlow>
+                  </div>
+                </div>
+                {mctsTrace && (
+                  <AlgorithmTracePanel
+                    trace={mctsTrace}
+                    variant="mcts"
+                    controls={[
+                      {
+                        label: 'Frame',
+                        value: `${demoIndex + 1} / ${demoFrames.length}`,
+                        onPrevious: goToPreviousFrame,
+                        onNext: goToNextFrame,
+                        canPrevious: canStepBack,
+                        canNext: canStepForward,
+                      },
+                      ...(mctsGraphHistory.length > 0
+                        ? [
+                            {
+                              label: 'Decision step',
+                              value: `${(selectedHistoricalMCTSGraphIndex ?? 0) + 1}`,
+                              onPrevious: goToPreviousHistoricalGraph,
+                              onNext: goToNextHistoricalGraph,
+                              canPrevious: canViewPreviousHistoricalGraph,
+                              canNext: canViewNextHistoricalGraph,
+                            },
+                          ]
+                        : []),
+                    ]}
+                  />
+                )}
               </div>
             </div>
           </section>
         )}
-      </section>
+      </div>
     </main>
   )
 }

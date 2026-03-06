@@ -13,9 +13,11 @@ export type AlgorithmKind = 'astar' | 'mcts'
 
 export type AStarFramePhase =
   | 'init'
+  | 'loop'
   | 'expand'
   | 'consider-neighbor'
   | 'update-neighbor'
+  | 'update-queue'
   | 'skip-neighbor'
   | 'goal-found'
   | 'finished'
@@ -63,8 +65,10 @@ export type AStarResult = {
 
 export type MCTSFramePhase =
   | 'init'
+  | 'loop'
   | 'selection'
   | 'expansion'
+  | 'expansion-else'
   | 'rollout'
   | 'backprop'
   | 'iteration-end'
@@ -302,6 +306,20 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
   })
 
   while (openSet.size > 0) {
+    pushFrame({
+      phase: 'loop',
+      message: `Loop: openSet has ${openSet.size} node(s), choosing next to expand.`,
+      current: null,
+      action: null,
+      neighbor: null,
+      openSet: [...openSet],
+      closedSet: [...closedSet],
+      pathPreview: finalPath,
+      reachedGoal: false,
+      scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+      activeTreeNodeId: null,
+      rejectedChild: null,
+    })
     const current = [...openSet].sort((left, right) => {
       const fDiff = (fScore[left] ?? Number.POSITIVE_INFINITY) - (fScore[right] ?? Number.POSITIVE_INFINITY)
       if (fDiff !== 0) {
@@ -421,6 +439,20 @@ export function runAStarDemo(config: AStarConfig): AStarResult {
         pushFrame({
           phase: 'update-neighbor',
           message: `Updated ${neighbor}: expected g=${tentativeG}, f=${fScore[neighbor]}.`,
+          current,
+          action,
+          neighbor,
+          openSet: [...openSet],
+          closedSet: [...closedSet],
+          pathPreview: preview,
+          reachedGoal: false,
+          scoreRows: makeScoreRows(gScore, fScore, cameFrom, goal),
+          activeTreeNodeId: currentTreeNodeId,
+          rejectedChild: null,
+        })
+        pushFrame({
+          phase: 'update-queue',
+          message: `Kept ${neighbor} in openSet.`,
           current,
           action,
           neighbor,
@@ -708,6 +740,14 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
 
     pushFrame({
       iteration,
+      phase: 'loop',
+      message: `Iteration ${iteration} of ${iterations}: starting loop.`,
+      activeNodeId: root.id,
+      selectionPathIds: [root.id],
+      rolloutTiles: [start],
+    })
+    pushFrame({
+      iteration,
       phase: 'selection',
       message: `Iteration ${iteration}: starting selection at root.`,
       activeNodeId: current.id,
@@ -753,6 +793,7 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       })
     }
 
+    let expandedThisIteration = false
     if (!isTerminalTile(current.tile, goal) && current.untriedActions.length > 0) {
       const actionIndex = Math.floor(rng() * current.untriedActions.length)
       const [action] = current.untriedActions.splice(actionIndex, 1)
@@ -777,6 +818,18 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
         iteration,
         phase: 'expansion',
         message: `Expanded action ${action} to node ${current.id} (${current.tile}).`,
+        activeNodeId: current.id,
+        selectionPathIds: [...selectionPath],
+        rolloutTiles: selectionPath.map((nodeId) => nodes.get(nodeId)?.tile ?? start),
+      })
+      expandedThisIteration = true
+    }
+
+    if (!expandedThisIteration) {
+      pushFrame({
+        iteration,
+        phase: 'expansion-else',
+        message: `Leaf has no untried action; skipping expansion, starting rollout from ${current.tile}.`,
         activeNodeId: current.id,
         selectionPathIds: [...selectionPath],
         rolloutTiles: selectionPath.map((nodeId) => nodes.get(nodeId)?.tile ?? start),
