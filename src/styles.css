@@ -133,6 +133,10 @@ dd {
 
 .board-grid-shell {
   width: 100%;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
@@ -141,7 +145,7 @@ dd {
 .board-grid {
   --label-col-size: 32px;
   --label-row-size: 24px;
-  --cell-size: clamp(80px, 10vw, 140px);
+  --cell-size: clamp(38px, 10vw, 140px);
   display: grid;
   grid-template-columns: var(--label-col-size) repeat(var(--board-columns), var(--cell-size));
   grid-template-rows: var(--label-row-size) repeat(var(--board-rows), var(--cell-size));
@@ -149,6 +153,7 @@ dd {
   align-items: stretch;
   position: relative;
   width: max-content;
+  max-width: 100%;
   margin-inline: auto;
 }
 
@@ -172,7 +177,9 @@ dd {
   place-items: center;
   width: var(--cell-size);
   height: var(--cell-size);
-  padding: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: clamp(3px, calc(var(--cell-size) * 0.075), 6px);
   border: 1px dashed #7d8baa;
   background: #fffefc;
 }
@@ -263,7 +270,7 @@ dd {
 }
 
 .cell-id {
-  font-size: 1.6rem;
+  font-size: clamp(0.95rem, calc(var(--cell-size) * 0.32), 1.6rem);
   font-weight: 700;
   color: #334155;
   opacity: 0.9;
@@ -381,10 +388,10 @@ dd {
 
 .board-avatar {
   position: absolute;
-  width: 32px;
-  height: 32px;
+  width: clamp(18px, calc(var(--cell-size) * 0.38), 32px);
+  height: clamp(18px, calc(var(--cell-size) * 0.38), 32px);
   border-radius: 999px;
-  border: 3px solid #ffffff;
+  border: clamp(2px, calc(var(--cell-size) * 0.035), 3px) solid #ffffff;
   background: #214ecf;
   box-shadow: 0 4px 12px rgba(33, 78, 207, 0.35);
   transform: translate(-50%, -50%);
@@ -1389,7 +1396,7 @@ dd {
   .board-grid {
     --label-col-size: 24px;
     --label-row-size: 20px;
-    --cell-size: min(78px, calc((100vw - 76px) / var(--board-columns)));
+    --cell-size: clamp(38px, calc((100vw - 76px) / var(--board-columns)), 78px);
   }
 
   .board-cell {

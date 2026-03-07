@@ -1375,7 +1375,8 @@ function AlgorithmTracePanel({
 }
 
 function App() {
-  const [currentTile, setCurrentTile] = useState<TileId>(() => getRandomStartTile())
+  const [startTile, setStartTile] = useState<TileId>(() => getRandomStartTile())
+  const [currentTile, setCurrentTile] = useState<TileId>(() => startTile)
   const [algorithm, setAlgorithm] = useState<AlgorithmKind>('astar')
   const [goalTile, setGoalTile] = useState<TileId>('2F')
   const [astarHeuristicExpression, setAStarHeuristicExpression] = useState(
@@ -1394,8 +1395,11 @@ function App() {
   const [mctsGraphHistory, setMctsGraphHistory] = useState<MCTSGraphHistoryEntry[]>([])
   const [selectedHistoricalMCTSGraphIndex, setSelectedHistoricalMCTSGraphIndex] = useState<number | null>(null)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
+  const [boardCellSize, setBoardCellSize] = useState<number | null>(null)
   const tokenAnimationCounterRef = useRef(0)
   const tokenAnimationTimerRef = useRef<number | null>(null)
+  const boardGridShellRef = useRef<HTMLDivElement | null>(null)
+  const boardGridRef = useRef<HTMLDivElement | null>(null)
 
   const allTiles = useMemo(() => getAllTiles(), [])
   const astarHeuristicAnalysis = useMemo(
@@ -1513,6 +1517,13 @@ function App() {
     setIsAutoPlay(false)
     setDemoIndex((index) => Math.min(index + 1, demoFrames.length - 1))
   }, [demoFrames.length])
+  const clearPlaybackState = useCallback(() => {
+    setDemoFrames([])
+    setDemoIndex(0)
+    setIsAutoPlay(false)
+    setMctsGraphHistory([])
+    setSelectedHistoricalMCTSGraphIndex(null)
+  }, [])
 
   const clearTokenAnimation = useCallback(() => {
     if (tokenAnimationTimerRef.current !== null) {
@@ -1566,6 +1577,41 @@ function App() {
   )
 
   useEffect(() => {
+    const boardGridShell = boardGridShellRef.current
+    const boardGrid = boardGridRef.current
+
+    if (!boardGridShell || !boardGrid) {
+      return
+    }
+
+    const updateBoardCellSize = () => {
+      const labelColumnSize =
+        Number.parseFloat(window.getComputedStyle(boardGrid).getPropertyValue('--label-col-size')) || 32
+      const availableCellWidth = boardGridShell.clientWidth - labelColumnSize
+
+      if (availableCellWidth <= 0) {
+        return
+      }
+
+      const nextCellSize = Math.min(140, Math.max(38, availableCellWidth / COLUMNS.length))
+      setBoardCellSize((current) =>
+        current !== null && Math.abs(current - nextCellSize) < 0.5 ? current : nextCellSize,
+      )
+    }
+
+    updateBoardCellSize()
+
+    const resizeObserver = new ResizeObserver(() => {
+      updateBoardCellSize()
+    })
+    resizeObserver.observe(boardGridShell)
+
+    return () => {
+      resizeObserver.disconnect()
+    }
+  }, [])
+
+  useEffect(() => {
     if (mctsGraphHistory.length === 0) {
       setSelectedHistoricalMCTSGraphIndex(null)
       return
@@ -1587,19 +1633,26 @@ function App() {
 
   const handleReset = useCallback(() => {
     clearTokenAnimation()
-    setCurrentTile(getRandomStartTile())
-    setDemoFrames([])
-    setDemoIndex(0)
-    setIsAutoPlay(false)
-    setMctsGraphHistory([])
-    setSelectedHistoricalMCTSGraphIndex(null)
-  }, [clearTokenAnimation])
+    setCurrentTile(startTile)
+    clearPlaybackState()
+  }, [clearPlaybackState, clearTokenAnimation, startTile])
+
+  const handleStartTileChange = useCallback(
+    (tile: TileId) => {
+      clearTokenAnimation()
+      setStartTile(tile)
+      setCurrentTile(tile)
+      clearPlaybackState()
+    },
+    [clearPlaybackState, clearTokenAnimation],
+  )
 
   const performStep = useCallback(
     (action: Action) => {
       const sampledTransition = sampleTransition(currentTile, action, Math.random, goalTile)
 
       animateTokenMove(currentTile, sampledTransition.destination, action)
+      setStartTile(sampledTransition.destination)
       setCurrentTile(sampledTransition.destination)
     },
     [animateTokenMove, currentTile, goalTile],
@@ -1621,12 +1674,6 @@ function App() {
         return
       }
 
-      if (event.key === 'r' || event.key === 'R') {
-        event.preventDefault()
-        handleReset()
-        return
-      }
-
       const action = keyToAction[event.key]
 
       if (!action) {
@@ -1639,7 +1686,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleReset, performStep])
+  }, [performStep])
 
   const runAlgorithm = useCallback(() => {
     clearTokenAnimation()
@@ -1810,15 +1857,15 @@ function App() {
           <p className="eyebrow">Text RPG visualizer</p>
           <h1>Dungeon Crawler</h1>
           <ul className="hero-rules">
-            <li>3×6 grid (rows 1–3, columns A–F). Start on a random tile.</li>
-            <li>Each step: choose up, down, left, or right.</li>
+            <li>3×6 grid (rows 1–3, columns A–F). Pick the starting location from the controls.</li>
+            <li>Arrow keys move the starting location one step at a time.</li>
             <li>
               <strong>White</strong>: move as chosen. <strong>Blue</strong>: 50% stay, else move. <strong>Red/Green</strong>: absorbing (never leave).
             </li>
             <li>
               <strong>Goal</strong>: reaching the goal tile is absorbing (you win and stay).
             </li>
-            <li>Wall hits: stay in place.</li>
+            <li>Reset returns you to the selected starting location. Wall hits keep you in place.</li>
           </ul>
         </section>
 
@@ -1830,13 +1877,15 @@ function App() {
             </p>
           </div>
 
-          <div className="board-grid-shell">
+          <div className="board-grid-shell" ref={boardGridShellRef}>
             <div
               className="board-grid"
+              ref={boardGridRef}
               style={
                 {
                   '--board-columns': COLUMNS.length,
                   '--board-rows': BOARD_ROWS.length,
+                  ...(boardCellSize === null ? {} : { '--cell-size': `${boardCellSize}px` }),
                 } as CSSProperties
               }
               aria-label="Dungeon board"
@@ -1991,10 +2040,10 @@ function App() {
               <strong>G</strong>: goal
             </span>
             <span>
-              <strong>Arrows</strong>: move and step
+              <strong>Arrows</strong>: move starting location
             </span>
             <span>
-              <strong>R</strong>: reset
+              <strong>Start</strong>: {startTile}
             </span>
             <span>
               <strong>Goal</strong>: {goalTile}
@@ -2018,6 +2067,20 @@ function App() {
               >
                 <option value="astar">A*</option>
                 <option value="mcts">MCTS</option>
+              </select>
+            </label>
+
+            <label>
+              Starting location
+              <select
+                value={startTile}
+                onChange={(event) => handleStartTileChange(event.target.value as TileId)}
+              >
+                {allTiles.map((tile: TileId) => (
+                  <option key={tile} value={tile}>
+                    {tile}
+                  </option>
+                ))}
               </select>
             </label>
 
@@ -2174,6 +2237,13 @@ function App() {
               disabled={algorithm === 'astar' && astarHeuristicAnalysis.error !== null}
             >
               Start
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={handleReset}
+            >
+              Reset
             </button>
             <button
               className="secondary-button"
