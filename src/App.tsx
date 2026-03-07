@@ -1392,6 +1392,8 @@ function App() {
   const [mctsHorizon, setMctsHorizon] = useState(100)
   const [mctsGoalReward, setMctsGoalReward] = useState(10)
   const [mctsTrapReward, setMctsTrapReward] = useState(-1)
+  const [mctsStuckReward, setMctsStuckReward] = useState(0)
+  const [mctsNormalReward, setMctsNormalReward] = useState(0)
   const [mctsGraphHistory, setMctsGraphHistory] = useState<MCTSGraphHistoryEntry[]>([])
   const [selectedHistoricalMCTSGraphIndex, setSelectedHistoricalMCTSGraphIndex] = useState<number | null>(null)
   const [tokenAnimation, setTokenAnimation] = useState<TokenAnimation | null>(null)
@@ -1732,6 +1734,8 @@ function App() {
         rolloutHorizon: mctsHorizon,
         goalReward: mctsGoalReward,
         trapReward: mctsTrapReward,
+        stuckReward: mctsStuckReward,
+        normalReward: mctsNormalReward,
         rng: Math.random,
       })
 
@@ -1796,6 +1800,8 @@ function App() {
     mctsGoalReward,
     mctsHorizon,
     mctsIterations,
+    mctsNormalReward,
+    mctsStuckReward,
     mctsTrapReward,
   ])
   const goToPreviousHistoricalGraph = useCallback(() => {
@@ -2224,6 +2230,22 @@ function App() {
                   type="number"
                   value={formatInputNumber(mctsTrapReward)}
                   onChange={(event) => setMctsTrapReward(Number(event.target.value) || 0)}
+                />
+              </label>
+              <label>
+                Stuck reward
+                <input
+                  type="number"
+                  value={formatInputNumber(mctsStuckReward)}
+                  onChange={(event) => setMctsStuckReward(Number(event.target.value) || 0)}
+                />
+              </label>
+              <label>
+                Normal reward
+                <input
+                  type="number"
+                  value={formatInputNumber(mctsNormalReward)}
+                  onChange={(event) => setMctsNormalReward(Number(event.target.value) || 0)}
                 />
               </label>
             </div>

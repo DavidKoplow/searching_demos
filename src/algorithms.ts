@@ -150,6 +150,8 @@ type MCTSConfig = {
   rolloutHorizon: number
   goalReward?: number
   trapReward?: number
+  stuckReward?: number
+  normalReward?: number
   rng?: () => number
 }
 
@@ -575,30 +577,41 @@ function rewardForTile(
   goal: TileId,
   goalReward: number = 10,
   trapReward: number = -1,
+  stuckReward: number = 0,
+  normalReward: number = 0,
 ) {
   if (tile === goal) {
     return goalReward
   }
-  if (getTileType(tile) === 'T') {
+
+  const tileType = getTileType(tile)
+  if (tileType === 'T') {
     return trapReward
   }
-  return 0
+
+  if (tileType === 'S') {
+    return stuckReward
+  }
+
+  return normalReward
 }
 
-function discountedRewardForTile(
-  tile: TileId,
+function discountedRewardForRollout(
+  tiles: TileId[],
   goal: TileId,
-  stepsAhead: number,
   gamma: number,
   goalReward: number = 10,
   trapReward: number = -1,
+  stuckReward: number = 0,
+  normalReward: number = 0,
 ) {
-  const baseReward = rewardForTile(tile, goal, goalReward, trapReward)
-  if (baseReward === 0) {
-    return 0
-  }
-
-  return Math.pow(gamma, Math.max(0, stepsAhead)) * baseReward
+  return tiles.reduce(
+    (totalReward, tile, stepsAhead) =>
+      totalReward +
+      Math.pow(gamma, Math.max(0, stepsAhead)) *
+        rewardForTile(tile, goal, goalReward, trapReward, stuckReward, normalReward),
+    0,
+  )
 }
 
 function isTerminalTile(tile: TileId, goal: TileId) {
@@ -628,6 +641,8 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
     rolloutHorizon,
     goalReward = 10,
     trapReward = -1,
+    stuckReward = 0,
+    normalReward = 0,
   } = config
   const rng = createRng(config.rng)
 
@@ -858,13 +873,14 @@ export function runMCTSDemo(config: MCTSConfig): MCTSResult {
       rolloutTiles,
     })
 
-    let reward = discountedRewardForTile(
-      rolloutState,
+    let reward = discountedRewardForRollout(
+      rolloutTiles,
       goal,
-      rolloutTiles.length - 1,
       gamma,
       goalReward,
       trapReward,
+      stuckReward,
+      normalReward,
     )
     for (let pathIndex = selectionPath.length - 1; pathIndex >= 0; pathIndex -= 1) {
       const nodeId = selectionPath[pathIndex]
