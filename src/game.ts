@@ -286,6 +286,59 @@ export function expectedTurnsForDestination(tile: TileId, action: Action, destin
   return 1 / probability
 }
 
+export function slipActionOutcomes(
+  tile: TileId,
+  action: Action,
+  successProb: number,
+  goalTile?: TileId,
+): TransitionOutcome[] {
+  const p = Math.max(0, Math.min(1, successProb))
+  const others = ACTIONS.filter((a) => a !== action)
+  const weights: Array<{ a: Action; w: number }> = [
+    { a: action, w: p },
+    ...others.map((a) => ({ a, w: (1 - p) / others.length })),
+  ]
+  const accumulator = new Map<TileId, TransitionOutcome>()
+  for (const { a, w } of weights) {
+    if (w <= 0) continue
+    const { outcomes } = transitionForAction(tile, a, goalTile)
+    for (const outcome of outcomes) {
+      const weighted = w * outcome.probability
+      const existing = accumulator.get(outcome.destination)
+      if (existing) {
+        existing.probability += weighted
+      } else {
+        accumulator.set(outcome.destination, {
+          destination: outcome.destination,
+          probability: weighted,
+          explanation: outcome.explanation,
+        })
+      }
+    }
+  }
+  return [...accumulator.values()].sort((l, r) => r.probability - l.probability)
+}
+
+export function sampleSlipTransition(
+  tile: TileId,
+  action: Action,
+  successProb: number,
+  rng: () => number = Math.random,
+  goalTile?: TileId,
+): { destination: TileId; explanation: string } {
+  const outcomes = slipActionOutcomes(tile, action, successProb, goalTile)
+  const roll = rng()
+  let cumulative = 0
+  for (const outcome of outcomes) {
+    cumulative += outcome.probability
+    if (roll <= cumulative) {
+      return { destination: outcome.destination, explanation: outcome.explanation }
+    }
+  }
+  const last = outcomes[outcomes.length - 1]
+  return { destination: last.destination, explanation: last.explanation }
+}
+
 export function deterministicTransition(tile: TileId, action: Action, goalTile?: TileId): MoveAttempt {
   if (getTileType(tile) === 'T' || (goalTile && tile === goalTile)) {
     return {

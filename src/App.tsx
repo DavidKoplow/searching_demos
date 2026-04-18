@@ -13,6 +13,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
+  ACTIONS,
   BOARD_ROWS,
   COLUMNS,
   type Action,
@@ -39,6 +40,31 @@ import {
   type AStarAdmissibilityViolation,
   type AStarConsistencyViolation,
 } from './astarHeuristic'
+import {
+  DEFAULT_VI_REWARDS,
+  runValueIteration,
+  type RewardConfig,
+  type VIResult,
+} from './valueIteration'
+import {
+  buildExpectimaxTree,
+  type ExpectimaxChanceNode,
+  type ExpectimaxLeafNode,
+  type ExpectimaxNode,
+  type ExpectimaxResult,
+} from './expectimax'
+import { observationLabel, pointBelief, runPOMDP, type POMDPResult } from './pomdp'
+import { ColorLegend, Eq, IEq } from './equations'
+
+type TabKind = AlgorithmKind | 'vi' | 'expectimax' | 'pomdp'
+
+const TAB_DEFINITIONS: Array<{ kind: TabKind; label: string; description: string }> = [
+  { kind: 'astar', label: 'A*', description: 'Deterministic planning with a heuristic.' },
+  { kind: 'mcts', label: 'MCTS', description: 'Tree search with random rollouts.' },
+  { kind: 'vi', label: 'Value Iteration', description: 'Iterate V(s) over the full MDP.' },
+  { kind: 'expectimax', label: 'Expectimax (MDP)', description: 'Finite-horizon tree with chance nodes.' },
+  { kind: 'pomdp', label: 'POMDP (Q_MDP)', description: 'Belief-state tracking with noisy tile observations.' },
+]
 
 type ExecutionFrame = {
   kind: 'execution'
@@ -1374,10 +1400,257 @@ function AlgorithmTracePanel({
   )
 }
 
+function formatV(value: number): string {
+  if (!Number.isFinite(value)) return '∞'
+  if (Math.abs(value) < 1e-9) return '0.00'
+  return value.toFixed(2)
+}
+
+function formatVShort(value: number): string {
+  if (!Number.isFinite(value)) return '∞'
+  if (Math.abs(value) < 1e-9) return '0.0'
+  return value.toFixed(1)
+}
+
+function softmaxPolicy(q: Record<Action, number>): Record<Action, number> {
+  const vals = ACTIONS.map((a) => q[a])
+  const max = Math.max(...vals)
+  const exps = vals.map((v) => Math.exp(v - max))
+  const sum = exps.reduce((a, b) => a + b, 0)
+  const out = {} as Record<Action, number>
+  ACTIONS.forEach((a, i) => {
+    out[a] = sum > 0 ? exps[i] / sum : 0.25
+  })
+  return out
+}
+
+function actionArrow(action: Action | null | undefined): string {
+  if (!action) return ''
+  if (action === 'up') return '↑'
+  if (action === 'down') return '↓'
+  if (action === 'left') return '←'
+  return '→'
+}
+
+function BeliefBoard({
+  belief,
+  trueTile,
+  goalTile,
+}: {
+  belief: Record<TileId, number>
+  trueTile: TileId
+  goalTile: TileId
+}) {
+  const maxP = Math.max(...Object.values(belief), 1e-9)
+  return (
+    <div className="vi-board">
+      <div className="vi-board-grid">
+        <div className="vi-corner" />
+        {COLUMNS.map((col) => (
+          <div key={col} className="vi-axis">
+            {col}
+          </div>
+        ))}
+        {BOARD_ROWS.map((row) => (
+          <Fragment key={row}>
+            <div className="vi-axis">{row}</div>
+            {COLUMNS.map((col) => {
+              const tile = `${row}${col}` as TileId
+              const type = getTileType(tile)
+              const p = belief[tile] ?? 0
+              const isGoal = tile === goalTile
+              const isTrue = tile === trueTile
+              const intensity = Math.min(1, p / maxP)
+              const alpha = 0.1 + intensity * 0.8
+              return (
+                <div
+                  key={tile}
+                  className={`vi-cell tile-${type.toLowerCase()}${isGoal ? ' vi-cell-goal' : ''}${isTrue ? ' vi-cell-true' : ''}`}
+                  style={{ background: `rgba(37, 99, 235, ${alpha})` }}
+                >
+                  <span className="vi-cell-tile">{tile}</span>
+                  <span className="vi-cell-v">{(p * 100).toFixed(1)}%</span>
+                  {isTrue && <span className="vi-cell-arrow">★</span>}
+                </div>
+              )
+            })}
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function buildExpectimaxDiagram(result: ExpectimaxResult, maxHorizonShown?: number) {
+  const limit = maxHorizonShown ?? result.horizon
+  const visibleNodes = result.nodes.filter((n) => result.horizon - n.horizonRemaining <= limit)
+  const visibleIds = new Set(visibleNodes.map((n) => n.id))
+  const graph = new dagre.graphlib.Graph()
+  graph.setDefaultEdgeLabel(() => ({}))
+  graph.setGraph({
+    rankdir: 'TB',
+    nodesep: 28,
+    ranksep: 56,
+    marginx: 20,
+    marginy: 20,
+  })
+
+  const nodeWidth = 150
+  const nodeHeight = 78
+
+  for (const node of visibleNodes) {
+    graph.setNode(node.id, { width: nodeWidth, height: nodeHeight })
+  }
+
+  type ExEdge = { source: string; target: string; label: string; kind: 'action' | 'chance' }
+  const edges: ExEdge[] = []
+  for (const node of visibleNodes) {
+    if (node.kind === 'max') {
+      for (const child of node.children) {
+        if (!visibleIds.has(child.node.id)) continue
+        edges.push({
+          source: node.id,
+          target: child.node.id,
+          label: `${describeAction(child.action)} Q=${child.q.toFixed(2)}`,
+          kind: 'action',
+        })
+      }
+    } else if (node.kind === 'chance') {
+      for (const child of node.children) {
+        if (!visibleIds.has(child.node.id)) continue
+        edges.push({
+          source: node.id,
+          target: child.node.id,
+          label: `p=${child.probability.toFixed(2)} r=${child.reward.toFixed(1)}`,
+          kind: 'chance',
+        })
+      }
+    }
+  }
+
+  for (const edge of edges) {
+    graph.setEdge(edge.source, edge.target)
+  }
+
+  dagre.layout(graph)
+
+  const flowNodes: Node[] = visibleNodes.map((node) => {
+    const pos = graph.node(node.id)
+    return {
+      id: node.id,
+      type: 'expectimaxNode',
+      data: { node },
+      draggable: false,
+      selectable: false,
+      position: { x: pos.x - nodeWidth / 2, y: pos.y - nodeHeight / 2 },
+      width: nodeWidth,
+      height: nodeHeight,
+      sourcePosition: Position.Bottom,
+      targetPosition: Position.Top,
+    }
+  })
+
+  const flowEdges: Edge[] = edges.map((edge, index) => ({
+    id: `${edge.source}-${edge.target}-${index}`,
+    source: edge.source,
+    target: edge.target,
+    type: 'straight',
+    label: edge.label,
+    labelStyle: {
+      fontSize: 10,
+      fontWeight: 600,
+      fill: edge.kind === 'chance' ? '#7c3aed' : '#2563eb',
+    },
+    labelBgPadding: [4, 2],
+    labelBgBorderRadius: 6,
+    labelBgStyle: {
+      fill: '#ffffff',
+      fillOpacity: 0.9,
+      stroke: '#d9e1ee',
+    },
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      width: 12,
+      height: 12,
+      color: edge.kind === 'chance' ? '#7c3aed' : '#2563eb',
+    },
+    style: {
+      stroke: edge.kind === 'chance' ? '#7c3aed' : '#2563eb',
+      strokeWidth: 1.6,
+      strokeDasharray: edge.kind === 'chance' ? '4 3' : undefined,
+    },
+  }))
+
+  return { nodes: flowNodes, edges: flowEdges }
+}
+
+function ExpectimaxNodeCard({ data }: NodeProps<Node<{ node: ExpectimaxNode }, 'expectimaxNode'>>) {
+  const node = data.node
+  if (node.kind === 'max') {
+    return (
+      <div className="expectimax-node expectimax-node-max">
+        <Handle type="target" position={Position.Top} className="mcts-flow-handle" />
+        <div className="expectimax-node-title">MAX · {node.tile}</div>
+        <div className="expectimax-node-value">V = {node.value.toFixed(2)}</div>
+        <div className="expectimax-node-sub">
+          best: {node.bestAction ? describeAction(node.bestAction) : '-'}
+        </div>
+        <Handle type="source" position={Position.Bottom} className="mcts-flow-handle" />
+      </div>
+    )
+  }
+  if (node.kind === 'chance') {
+    return (
+      <div className="expectimax-node expectimax-node-chance">
+        <Handle type="target" position={Position.Top} className="mcts-flow-handle" />
+        <div className="expectimax-node-title">
+          CHANCE · {describeAction(node.action)} from {node.tile}
+        </div>
+        <div className="expectimax-node-value">E[Q] = {node.value.toFixed(2)}</div>
+        <Handle type="source" position={Position.Bottom} className="mcts-flow-handle" />
+      </div>
+    )
+  }
+  const leaf = node as ExpectimaxLeafNode
+  return (
+    <div
+      className={`expectimax-node expectimax-node-leaf${leaf.reason === 'terminal' ? ' expectimax-node-terminal' : ''}`}
+    >
+      <Handle type="target" position={Position.Top} className="mcts-flow-handle" />
+      <div className="expectimax-node-title">
+        LEAF · {leaf.tile} ({leaf.reason})
+      </div>
+      <div className="expectimax-node-value">V = {leaf.value.toFixed(2)}</div>
+    </div>
+  )
+}
+
 function App() {
   const [startTile, setStartTile] = useState<TileId>(() => getRandomStartTile())
   const [currentTile, setCurrentTile] = useState<TileId>(() => startTile)
-  const [algorithm, setAlgorithm] = useState<AlgorithmKind>('astar')
+  const [activeTab, setActiveTab] = useState<TabKind>('astar')
+  const algorithm: AlgorithmKind = activeTab === 'mcts' ? 'mcts' : 'astar'
+  const [viGamma, setViGamma] = useState(0.9)
+  const [viMaxIterations, setViMaxIterations] = useState(40)
+  const [viMode, setViMode] = useState<'max' | 'random'>('max')
+  const [viActionSuccess, setViActionSuccess] = useState(0.7)
+  const [viRewards] = useState<RewardConfig>(DEFAULT_VI_REWARDS)
+  const [viResult, setViResult] = useState<VIResult | null>(null)
+  const [viIterationIndex, setViIterationIndex] = useState(0)
+  const [viPlaying, setViPlaying] = useState(false)
+  const [expectimaxHorizon, setExpectimaxHorizon] = useState(4)
+  const [expectimaxGamma, setExpectimaxGamma] = useState(0.9)
+  const [expectimaxActionSuccess, setExpectimaxActionSuccess] = useState(0.7)
+  const [expectimaxResult, setExpectimaxResult] = useState<ExpectimaxResult | null>(null)
+  const [expectimaxCurrentHorizon, setExpectimaxCurrentHorizon] = useState(0)
+  const [expectimaxPlaying, setExpectimaxPlaying] = useState(false)
+  const [pomdpGamma, setPomdpGamma] = useState(0.9)
+  const [pomdpAccuracy, setPomdpAccuracy] = useState(0.85)
+  const [pomdpActionSuccess, setPomdpActionSuccess] = useState(0.7)
+  const [pomdpMaxSteps, setPomdpMaxSteps] = useState(15)
+  const [pomdpResult, setPomdpResult] = useState<POMDPResult | null>(null)
+  const [pomdpFrameIndex, setPomdpFrameIndex] = useState(0)
+  const [pomdpPlaying, setPomdpPlaying] = useState(false)
   const [goalTile, setGoalTile] = useState<TileId>('2F')
   const [astarHeuristicExpression, setAStarHeuristicExpression] = useState(
     DEFAULT_ASTAR_HEURISTIC_EXPRESSION,
@@ -1435,9 +1708,16 @@ function App() {
   )
   const mctsCommittedTileSet = useMemo(() => new Set(mctsCommittedPath), [mctsCommittedPath])
   const mctsCommittedSegments = useMemo(() => buildPathSegments(mctsCommittedPath), [mctsCommittedPath])
-  const visibleTile = isViewingMCTSPlayback
-    ? mctsCommittedPath[mctsCommittedPath.length - 1] ?? currentTile
-    : frameVisibleTile
+  const pomdpCurrentFrame =
+    pomdpResult && pomdpResult.frames.length > 0
+      ? pomdpResult.frames[Math.min(pomdpFrameIndex, pomdpResult.frames.length - 1)]
+      : null
+  const visibleTile =
+    activeTab === 'pomdp' && pomdpCurrentFrame
+      ? pomdpCurrentFrame.trueTile
+      : isViewingMCTSPlayback
+        ? mctsCommittedPath[mctsCommittedPath.length - 1] ?? currentTile
+        : frameVisibleTile
   const currentType = getTileType(visibleTile)
   const restingTokenPosition = getTokenPosition(visibleTile)
   const astarHasDistinctNeighbor =
@@ -1506,6 +1786,29 @@ function App() {
     [displayedAStarFrame, goalTile],
   )
   const searchNodeTypes = useMemo(() => ({ searchNode: SearchFlowNodeCard }), [])
+  const expectimaxNodeTypes = useMemo(
+    () => ({ expectimaxNode: ExpectimaxNodeCard }),
+    [],
+  )
+  const expectimaxDiagram = useMemo(
+    () => (expectimaxResult ? buildExpectimaxDiagram(expectimaxResult, expectimaxCurrentHorizon) : null),
+    [expectimaxResult, expectimaxCurrentHorizon],
+  )
+  const expectimaxExpansionCounts = useMemo(() => {
+    const counts = new Map<TileId, number>()
+    if (!expectimaxResult) return counts
+    const limit = expectimaxCurrentHorizon
+    for (const node of expectimaxResult.nodes) {
+      if (node.kind !== 'max') continue
+      if (expectimaxResult.horizon - node.horizonRemaining > limit) continue
+      counts.set(node.tile, (counts.get(node.tile) ?? 0) + 1)
+    }
+    return counts
+  }, [expectimaxResult, expectimaxCurrentHorizon])
+  const currentVISnapshot =
+    viResult && viResult.snapshots.length > 0
+      ? viResult.snapshots[Math.min(viIterationIndex, viResult.snapshots.length - 1)]
+      : null
   const canViewPreviousHistoricalGraph =
     selectedHistoricalMCTSGraphIndex !== null && selectedHistoricalMCTSGraphIndex > 0
   const canViewNextHistoricalGraph =
@@ -1692,6 +1995,55 @@ function App() {
 
   const runAlgorithm = useCallback(() => {
     clearTokenAnimation()
+
+    if (activeTab === 'vi') {
+      const result = runValueIteration(
+        goalTile,
+        viGamma,
+        viMaxIterations,
+        viRewards,
+        1e-4,
+        viMode,
+        viActionSuccess,
+      )
+      setViResult(result)
+      setViIterationIndex(0)
+      setViPlaying(result.snapshots.length > 1)
+      return
+    }
+
+    if (activeTab === 'expectimax') {
+      const result = buildExpectimaxTree(
+        currentTile,
+        goalTile,
+        expectimaxHorizon,
+        expectimaxGamma,
+        viRewards,
+        expectimaxActionSuccess,
+      )
+      setExpectimaxResult(result)
+      setExpectimaxCurrentHorizon(1)
+      setExpectimaxPlaying(expectimaxHorizon > 1)
+      return
+    }
+
+    if (activeTab === 'pomdp') {
+      const result = runPOMDP({
+        start: currentTile,
+        goalTile,
+        gamma: pomdpGamma,
+        observationAccuracy: pomdpAccuracy,
+        actionSuccessProb: pomdpActionSuccess,
+        rewards: viRewards,
+        maxSteps: pomdpMaxSteps,
+        initialBelief: pointBelief(allTiles, currentTile),
+      })
+      setPomdpResult(result)
+      setPomdpFrameIndex(0)
+      setPomdpPlaying(result.frames.length > 1)
+      return
+    }
+
     setIsAutoPlay(true)
     if (algorithm === 'astar') {
       if (astarHeuristicAnalysis.error) {
@@ -1789,6 +2141,7 @@ function App() {
     setMctsGraphHistory(nextGraphHistory)
     setSelectedHistoricalMCTSGraphIndex(nextGraphHistory.length > 0 ? 0 : null)
   }, [
+    activeTab,
     algorithm,
     clearTokenAnimation,
     currentTile,
@@ -1803,6 +2156,18 @@ function App() {
     mctsNormalReward,
     mctsStuckReward,
     mctsTrapReward,
+    viGamma,
+    viMaxIterations,
+    viMode,
+    viActionSuccess,
+    viRewards,
+    expectimaxGamma,
+    expectimaxHorizon,
+    expectimaxActionSuccess,
+    pomdpGamma,
+    pomdpAccuracy,
+    pomdpActionSuccess,
+    pomdpMaxSteps,
   ])
   const goToPreviousHistoricalGraph = useCallback(() => {
     setIsAutoPlay(false)
@@ -1846,6 +2211,54 @@ function App() {
     return () => window.clearTimeout(timerId)
   }, [demoFrames.length, demoIndex, isAutoPlay, playbackMs])
 
+  useEffect(() => {
+    if (!viPlaying || !viResult) return
+    if (viIterationIndex >= viResult.snapshots.length - 1) {
+      setViPlaying(false)
+      return
+    }
+    const timerId = window.setTimeout(() => {
+      setViIterationIndex((idx) => {
+        const next = Math.min(idx + 1, viResult.snapshots.length - 1)
+        if (next >= viResult.snapshots.length - 1) setViPlaying(false)
+        return next
+      })
+    }, playbackMs)
+    return () => window.clearTimeout(timerId)
+  }, [viPlaying, viResult, viIterationIndex, playbackMs])
+
+  useEffect(() => {
+    if (!expectimaxPlaying) return
+    if (expectimaxCurrentHorizon >= expectimaxHorizon) {
+      setExpectimaxPlaying(false)
+      return
+    }
+    const timerId = window.setTimeout(() => {
+      setExpectimaxCurrentHorizon((h) => {
+        const next = Math.min(h + 1, expectimaxHorizon)
+        if (next >= expectimaxHorizon) setExpectimaxPlaying(false)
+        return next
+      })
+    }, playbackMs)
+    return () => window.clearTimeout(timerId)
+  }, [expectimaxPlaying, expectimaxCurrentHorizon, expectimaxHorizon, playbackMs])
+
+  useEffect(() => {
+    if (!pomdpPlaying || !pomdpResult) return
+    if (pomdpFrameIndex >= pomdpResult.frames.length - 1) {
+      setPomdpPlaying(false)
+      return
+    }
+    const timerId = window.setTimeout(() => {
+      setPomdpFrameIndex((idx) => {
+        const next = Math.min(idx + 1, pomdpResult.frames.length - 1)
+        if (next >= pomdpResult.frames.length - 1) setPomdpPlaying(false)
+        return next
+      })
+    }, playbackMs)
+    return () => window.clearTimeout(timerId)
+  }, [pomdpPlaying, pomdpResult, pomdpFrameIndex, playbackMs])
+
   const renderedTokenAnimation = activeFrame ? null : tokenAnimation
   const boardAvatarClassName = renderedTokenAnimation?.className ?? 'avatar-rest'
   const boardAvatarStyle = renderedTokenAnimation?.style ?? {
@@ -1877,7 +2290,23 @@ function App() {
 
         <div className="card board-card">
           <div className="section-heading">
-            <h2>Room Map</h2>
+            <h2>
+              Room Map
+              {activeTab === 'pomdp' && pomdpCurrentFrame && (
+                <span className="pomdp-step-tags">
+                  {pomdpCurrentFrame.action && (
+                    <span className="pomdp-tag pomdp-tag-action">
+                      action: <strong>{describeAction(pomdpCurrentFrame.action)}</strong>
+                    </span>
+                  )}
+                  {pomdpCurrentFrame.observation && (
+                    <span className="pomdp-tag pomdp-tag-obs">
+                      obs: <strong>{observationLabel(pomdpCurrentFrame.observation)}</strong>
+                    </span>
+                  )}
+                </span>
+              )}
+            </h2>
             <p>
               Displayed tile: <strong>{visibleTile}</strong> ({currentType})
             </p>
@@ -1918,17 +2347,108 @@ function App() {
                   const isMCTSPath = isViewingMCTSPlayback && mctsCommittedTileSet.has(tileId)
                   const scoreRow = astarScoreMap.get(tileId)
 
+                  const viQRow =
+                    activeTab === 'vi' && currentVISnapshot
+                      ? currentVISnapshot.Q[tileId]
+                      : null
+                  const viBest =
+                    activeTab === 'vi' && currentVISnapshot
+                      ? currentVISnapshot.policy[tileId]
+                      : null
+                  const pomdpQRow =
+                    activeTab === 'pomdp' && pomdpResult
+                      ? pomdpResult.finalSnapshot.Q[tileId]
+                      : null
+                  const pomdpBelief =
+                    activeTab === 'pomdp' && pomdpCurrentFrame
+                      ? pomdpCurrentFrame.belief[tileId] ?? 0
+                      : null
+                  const pomdpBest =
+                    activeTab === 'pomdp' && pomdpResult
+                      ? pomdpResult.finalSnapshot.policy[tileId]
+                      : null
+                  const expectimaxExpansions =
+                    activeTab === 'expectimax'
+                      ? expectimaxExpansionCounts.get(tileId) ?? 0
+                      : null
+
                   return (
                     <div
                       className={`board-cell ${tileClassName(tileId)} ${isCurrent ? 'current-cell' : ''} ${isGoal ? 'goal-cell' : ''} ${isOpen ? 'open-cell' : ''} ${isClosed ? 'closed-cell' : ''} ${isAStarPath ? 'path-preview-cell' : ''} ${isMCTSPath ? 'committed-path-cell' : ''}`}
                       key={tileId}
                     >
-                      <span className="cell-id">{tileId}</span>
+                      {!viQRow && !pomdpQRow && <span className="cell-id">{tileId}</span>}
+                      {expectimaxExpansions !== null && expectimaxExpansions > 0 && (
+                        <span
+                          className="expectimax-expansion-badge"
+                          title={`Expanded ${expectimaxExpansions} time${expectimaxExpansions === 1 ? '' : 's'} in the expectimax search`}
+                        >
+                          ×{expectimaxExpansions}
+                        </span>
+                      )}
                       {scoreRow && (scoreRow.g !== null || scoreRow.f !== null) && (
                         <span className="cell-score">
                           g:{formatAStarScore(scoreRow.g)} h:{formatGraphNumber(scoreRow.h)} f:{formatAStarScore(scoreRow.f)}
                         </span>
                       )}
+                      {viQRow && (
+                        <>
+                          <span className="vi-compass vi-compass-n">{formatVShort(viQRow.up)}</span>
+                          <span className="vi-compass vi-compass-s">{formatVShort(viQRow.down)}</span>
+                          <span className="vi-compass vi-compass-w">{formatVShort(viQRow.left)}</span>
+                          <span className="vi-compass vi-compass-e">{formatVShort(viQRow.right)}</span>
+                          <span className="vi-cell-center">
+                            {formatVShort(currentVISnapshot!.V[tileId])}
+                            {viBest && (
+                              <span className={`vi-center-arrow vi-center-arrow-${viBest}`} aria-hidden="true">
+                                {viBest === 'up' ? '↑' : viBest === 'down' ? '↓' : viBest === 'left' ? '←' : '→'}
+                              </span>
+                            )}
+                          </span>
+                        </>
+                      )}
+                      {pomdpQRow && pomdpBelief !== null && (() => {
+                        const pi = softmaxPolicy(pomdpQRow)
+                        const maxV = Math.max(pomdpQRow.up, pomdpQRow.down, pomdpQRow.left, pomdpQRow.right)
+                        return (
+                          <>
+                            <span className="pomdp-belief-box">{(pomdpBelief * 100).toFixed(0)}%</span>
+                            <span className="vi-compass vi-compass-n">
+                              {formatVShort(pomdpQRow.up)}
+                              <span className="pomdp-policy-prob">{(pi.up * 100).toFixed(0)}%</span>
+                            </span>
+                            <span className="vi-compass vi-compass-s">
+                              {formatVShort(pomdpQRow.down)}
+                              <span className="pomdp-policy-prob">{(pi.down * 100).toFixed(0)}%</span>
+                            </span>
+                            <span className="vi-compass vi-compass-w">
+                              {formatVShort(pomdpQRow.left)}
+                              <span className="pomdp-policy-prob">{(pi.left * 100).toFixed(0)}%</span>
+                            </span>
+                            <span className="vi-compass vi-compass-e">
+                              {formatVShort(pomdpQRow.right)}
+                              <span className="pomdp-policy-prob">{(pi.right * 100).toFixed(0)}%</span>
+                            </span>
+                            <span className="vi-cell-center">
+                              {formatVShort(maxV)}
+                              {pomdpBest && (
+                                <span
+                                  className={`vi-center-arrow vi-center-arrow-${pomdpBest}`}
+                                  aria-hidden="true"
+                                >
+                                  {pomdpBest === 'up'
+                                    ? '↑'
+                                    : pomdpBest === 'down'
+                                      ? '↓'
+                                      : pomdpBest === 'left'
+                                        ? '←'
+                                        : '→'}
+                                </span>
+                              )}
+                            </span>
+                          </>
+                        )
+                      })()}
                     </div>
                   )
                 })}
@@ -2028,6 +2548,22 @@ function App() {
                   className={`board-avatar ${boardAvatarClassName}`}
                   style={boardAvatarStyle}
                 />
+                {activeTab === 'pomdp' && pomdpCurrentFrame &&
+                  allTiles
+                    .filter((tile) => tile !== pomdpCurrentFrame.trueTile)
+                    .map((tile) => {
+                      const p = pomdpCurrentFrame.belief[tile] ?? 0
+                      if (p < 0.01) return null
+                      const pos = getTokenPosition(tile)
+                      return (
+                        <span
+                          key={`belief-${tile}`}
+                          className="board-avatar belief-avatar"
+                          style={{ left: pos.x, top: pos.y, opacity: p }}
+                          aria-hidden="true"
+                        />
+                      )
+                    })}
               </div>
             </div>
           </div>
@@ -2064,18 +2600,31 @@ function App() {
             <p>Compute timeline first, then execution timeline.</p>
           </div>
 
-          <div className="control-grid">
-            <label>
-              Algorithm
-              <select
-                value={algorithm}
-                onChange={(event) => setAlgorithm(event.target.value as AlgorithmKind)}
+          <div
+            className="algorithm-tabs"
+            role="tablist"
+            aria-label="Algorithm variant"
+          >
+            {TAB_DEFINITIONS.map((tab) => (
+              <button
+                key={tab.kind}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.kind}
+                className={`algorithm-tab${activeTab === tab.kind ? ' algorithm-tab-active' : ''}`}
+                onClick={() => setActiveTab(tab.kind)}
+                title={tab.description}
               >
-                <option value="astar">A*</option>
-                <option value="mcts">MCTS</option>
-              </select>
-            </label>
+                {tab.label}
+              </button>
+            ))}
+          </div>
 
+          <p className="algorithm-tab-description">
+            {TAB_DEFINITIONS.find((t) => t.kind === activeTab)?.description}
+          </p>
+
+          <div className="control-grid">
             <label>
               Starting location
               <select
@@ -2102,7 +2651,7 @@ function App() {
             </label>
           </div>
 
-          {algorithm === 'astar' && (
+          {activeTab === 'astar' && (
             <div className="heuristic-panel">
               <label className="heuristic-editor">
                 Heuristic expression
@@ -2171,7 +2720,7 @@ function App() {
             </div>
           )}
 
-          {algorithm === 'mcts' && (
+          {activeTab === 'mcts' && (
             <div className="control-grid">
               <label>
                 UCT c
@@ -2251,12 +2800,173 @@ function App() {
             </div>
           )}
 
+          {activeTab === 'vi' && (
+            <div className="control-grid">
+              <label>
+                Gamma (γ)
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(viGamma)}
+                  onChange={(event) =>
+                    setViGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+              <label>
+                Max iterations
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={viMaxIterations}
+                  onChange={(event) =>
+                    setViMaxIterations(Math.max(1, Math.floor(Number(event.target.value) || 1)))
+                  }
+                />
+              </label>
+              <label>
+                Action mode
+                <select
+                  value={viMode}
+                  onChange={(event) =>
+                    setViMode(event.target.value as 'max' | 'random')
+                  }
+                >
+                  <option value="max">max (Bellman optimality)</option>
+                  <option value="random">random (no actions — uniform policy)</option>
+                </select>
+              </label>
+              <label>
+                Action success prob
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(viActionSuccess)}
+                  onChange={(event) =>
+                    setViActionSuccess(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+            </div>
+          )}
+
+          {activeTab === 'expectimax' && (
+            <div className="control-grid">
+              <label>
+                Gamma (γ)
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(expectimaxGamma)}
+                  onChange={(event) =>
+                    setExpectimaxGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+              <label>
+                Horizon
+                <input
+                  type="number"
+                  min="1"
+                  max="6"
+                  step="1"
+                  value={expectimaxHorizon}
+                  onChange={(event) =>
+                    setExpectimaxHorizon(
+                      Math.min(6, Math.max(1, Math.floor(Number(event.target.value) || 1))),
+                    )
+                  }
+                />
+              </label>
+              <label>
+                Action success prob
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(expectimaxActionSuccess)}
+                  onChange={(event) =>
+                    setExpectimaxActionSuccess(
+                      Math.min(1, Math.max(0, Number(event.target.value) || 0)),
+                    )
+                  }
+                />
+              </label>
+            </div>
+          )}
+
+          {activeTab === 'pomdp' && (
+            <div className="control-grid">
+              <label>
+                Gamma (γ)
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(pomdpGamma)}
+                  onChange={(event) =>
+                    setPomdpGamma(Math.min(1, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+              <label>
+                Observation accuracy
+                <input
+                  type="number"
+                  min="0.34"
+                  max="1"
+                  step="0.01"
+                  value={formatInputNumber(pomdpAccuracy)}
+                  onChange={(event) =>
+                    setPomdpAccuracy(Math.min(1, Math.max(0.34, Number(event.target.value) || 0.34)))
+                  }
+                />
+              </label>
+              <label>
+                Max steps
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={pomdpMaxSteps}
+                  onChange={(event) =>
+                    setPomdpMaxSteps(Math.max(1, Math.floor(Number(event.target.value) || 1)))
+                  }
+                />
+              </label>
+              <label>
+                Action success prob
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={formatInputNumber(pomdpActionSuccess)}
+                  onChange={(event) =>
+                    setPomdpActionSuccess(
+                      Math.min(1, Math.max(0, Number(event.target.value) || 0)),
+                    )
+                  }
+                />
+              </label>
+            </div>
+          )}
+
           <div className="control-row">
             <button
               className="primary-button"
               type="button"
               onClick={runAlgorithm}
-              disabled={algorithm === 'astar' && astarHeuristicAnalysis.error !== null}
+              disabled={activeTab === 'astar' && astarHeuristicAnalysis.error !== null}
             >
               Start
             </button>
@@ -2310,7 +3020,29 @@ function App() {
 
         </section>
 
-        {displayedAStarFrame && (
+        {activeTab === 'astar' && (
+          <section className="card full-span-card algorithm-panel">
+            <div className="section-heading">
+              <h2>A* search</h2>
+              <p>Best-first deterministic search, ranking frontier nodes by f = g + h.</p>
+            </div>
+            <ColorLegend />
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>Score per tile.</strong> <IEq>{'g(\\cS{s})'}</IEq> is the known
+                expected-turn cost from the start. <IEq>{'h(\\cS{s})'}</IEq> is the
+                heuristic (admissible ⇒ never overestimates).
+              </p>
+              <Eq>{'f(\\cS{s}) = g(\\cS{s}) + h(\\cS{s})'}</Eq>
+              <p className="equation-caption">
+                <strong>Relaxation.</strong> When a shorter path to a neighbour is found,
+                update its parent and g-score:
+              </p>
+              <Eq>{'g(\\cS{s\'}) \\gets g(\\cS{s}) + c(\\cS{s},\\cA{a},\\cS{s\'})'}</Eq>
+            </div>
+          </section>
+        )}
+        {activeTab === 'astar' && displayedAStarFrame && (
           <section className="card full-span-card">
             <div className="tree-panel trace-tree-panel">
               <div className="tree-panel-layout">
@@ -2355,7 +3087,29 @@ function App() {
           </section>
         )}
 
-        {currentMCTSFrame && (
+        {activeTab === 'mcts' && (
+          <section className="card full-span-card algorithm-panel">
+            <div className="section-heading">
+              <h2>Monte Carlo Tree Search</h2>
+              <p>Incremental tree search with UCB selection and random rollouts.</p>
+            </div>
+            <ColorLegend />
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>UCB1 selection.</strong> Balance exploitation of the empirical
+                value <IEq>{'\\bar{W}(\\cS{s},\\cA{a})'}</IEq> against exploration of
+                under-visited children:
+              </p>
+              <Eq>{'\\text{UCB}(\\cS{s},\\cA{a}) = \\bar{W}(\\cS{s},\\cA{a}) + c\\sqrt{\\dfrac{\\ln N(\\cS{s})}{n(\\cS{s},\\cA{a})}}'}</Eq>
+              <p className="equation-caption">
+                <strong>Backpropagation.</strong> Each rollout return{' '}
+                <IEq>{'G = \\sum_t \\cG{\\gamma}^t \\cR{r_t}'}</IEq> is added to all
+                ancestors, increasing their visit counts.
+              </p>
+            </div>
+          </section>
+        )}
+        {activeTab === 'mcts' && currentMCTSFrame && (
           <section className="card full-span-card">
             <div className="tree-panel trace-tree-panel">
               <div className="tree-panel-layout">
@@ -2410,6 +3164,649 @@ function App() {
                 )}
               </div>
             </div>
+          </section>
+        )}
+
+        {activeTab === 'vi' && (
+          <section className="card full-span-card algorithm-panel">
+            <div className="section-heading">
+              <h2>Value Iteration</h2>
+              <p>
+                Bellman backups over the full MDP, one sweep per iteration. Unlike
+                expectimax, VI computes <IEq>{'\\cV{V}(\\cS{s})'}</IEq> for <em>every</em>{' '}
+                tile and re-uses previously-computed values — so it solves an infinite
+                horizon problem in polynomial time instead of branching out a finite tree.
+              </p>
+            </div>
+            <ColorLegend />
+            <div className="equation-block">
+              {viMode === 'max' ? (
+                <>
+                  <p className="equation-caption">
+                    <strong>Bellman optimality update.</strong> We iterate the optimal
+                    value until it stops changing. At iteration k+1, take the action that
+                    maximises the expected one-step reward plus the{' '}
+                    <IEq>{'\\cG{\\gamma}'}</IEq>-discounted continuation:
+                  </p>
+                  <Eq>{'\\cV{V_{k+1}}(\\cS{s}) = \\max_{\\cA{a}}\\sum_{\\cS{s\'}} \\cT{T}(\\cS{s},\\cA{a},\\cS{s\'})\\bigl[\\cR{R}(\\cS{s},\\cA{a},\\cS{s\'}) + \\cG{\\gamma}\\,\\cV{V_k}(\\cS{s\'})\\bigr]'}</Eq>
+                  <p className="equation-caption">
+                    In this gridworld <IEq>{'\\cT{T}'}</IEq> is 50/50 for stuck tiles and
+                    deterministic otherwise; <IEq>{'\\cR{R}'}</IEq> is a per-tile reward
+                    plus a small step cost. Traps and the goal are absorbing.
+                  </p>
+                  <Eq>{'\\pi_{\\cV{V}}(\\cS{s}) = \\arg\\max_{\\cA{a}} \\sum_{\\cS{s\'}} \\cT{T}(\\cS{s},\\cA{a},\\cS{s\'})\\bigl[\\cR{R}(\\cS{s},\\cA{a},\\cS{s\'}) + \\cG{\\gamma}\\,\\cV{V}(\\cS{s\'})\\bigr]'}</Eq>
+                </>
+              ) : (
+                <>
+                  <p className="equation-caption">
+                    <strong>Random-policy evaluation (no <IEq>{'\\max'}</IEq>).</strong>{' '}
+                    The agent has no policy — at every state it picks an action uniformly
+                    at random. Iterate the Bellman <em>expectation</em> operator under{' '}
+                    <IEq>{'\\pi(\\cA{a} \\mid \\cS{s}) = 1/|\\cA{A}|'}</IEq>. The result
+                    is <IEq>{'\\cV{V^{\\pi_{\\text{rand}}}}(\\cS{s})'}</IEq>, the value of
+                    acting randomly:
+                  </p>
+                  <Eq>{'\\cV{V_{k+1}}(\\cS{s}) = \\frac{1}{|\\cA{A}|}\\sum_{\\cA{a}} \\sum_{\\cS{s\'}} \\cT{T}(\\cS{s},\\cA{a},\\cS{s\'})\\bigl[\\cR{R}(\\cS{s},\\cA{a},\\cS{s\'}) + \\cG{\\gamma}\\,\\cV{V_k}(\\cS{s\'})\\bigr]'}</Eq>
+                  <p className="equation-caption">
+                    No <IEq>{'\\max'}</IEq> — each sweep is linear in states and averages
+                    the four Q-values. This is a lower bound on V<sup>*</sup> and shows
+                    what can be learned about value purely from the dynamics, with no
+                    decisions.
+                  </p>
+                </>
+              )}
+            </div>
+            {currentVISnapshot ? (
+              <>
+                <div className="vi-controls">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setViIterationIndex(0)}
+                    disabled={viIterationIndex === 0}
+                  >
+                    Iter 0
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setViIterationIndex((i) => Math.max(0, i - 1))}
+                    disabled={viIterationIndex === 0}
+                  >
+                    Prev
+                  </button>
+                  <input
+                    type="range"
+                    min={0}
+                    max={viResult!.snapshots.length - 1}
+                    value={viIterationIndex}
+                    onChange={(event) => setViIterationIndex(Number(event.target.value))}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() =>
+                      setViIterationIndex((i) =>
+                        Math.min(viResult!.snapshots.length - 1, i + 1),
+                      )
+                    }
+                    disabled={viIterationIndex >= viResult!.snapshots.length - 1}
+                  >
+                    Next
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setViIterationIndex(viResult!.snapshots.length - 1)}
+                    disabled={viIterationIndex >= viResult!.snapshots.length - 1}
+                  >
+                    End
+                  </button>
+                </div>
+                <p className="vi-summary">
+                  Iteration <strong>{currentVISnapshot.iteration}</strong> / {viResult!.snapshots.length - 1}{' '}
+                  · max |ΔV| = {Number.isFinite(currentVISnapshot.maxDelta) ? currentVISnapshot.maxDelta.toFixed(4) : '∞'}{' '}
+                  · γ = {viResult!.gamma} · {viResult!.converged ? 'Converged' : 'Not converged yet'}
+                </p>
+                <p className="vi-legend">
+                  Room Map cells show Q(s, a) at each of the four compass edges
+                  (top=up, bottom=down, left=left, right=right) and V(s) in the center,
+                  at iteration {currentVISnapshot.iteration}. The{' '}
+                  <strong>bold</strong> edge number is the greedy action π(s)
+                  {viMode === 'random' ? ' (hidden — random policy has no argmax)' : ''}.
+                </p>
+                <details open className="per-step-details">
+                  <summary>
+                    Q(s, a) across all iterations — one row per (state, action) pair
+                  </summary>
+                  <div className="step-table-scroll">
+                    <table className="step-table vi-history-table">
+                      <thead>
+                        <tr>
+                          <th>Tile</th>
+                          <th>Action</th>
+                          {viResult!.snapshots.map((snap) => (
+                            <th key={snap.iteration}>k={snap.iteration}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getAllTiles().flatMap((tile) =>
+                          (['up', 'down', 'left', 'right'] as Action[]).map((a) => (
+                            <tr
+                              key={`${tile}-${a}`}
+                              className={tile === viResult!.goalTile ? 'step-table-goal' : ''}
+                            >
+                              <td>
+                                {tile} ({getTileType(tile)})
+                              </td>
+                              <td>
+                                {actionArrow(a)} {a}
+                              </td>
+                              {viResult!.snapshots.map((snap) => {
+                                const best = snap.policy[tile] === a
+                                return (
+                                  <td
+                                    key={snap.iteration}
+                                    className={`num${best ? ' step-table-best' : ''}${
+                                      snap.iteration === currentVISnapshot.iteration
+                                        ? ' step-table-current'
+                                        : ''
+                                    }`}
+                                  >
+                                    {formatV(snap.Q[tile][a])}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          )),
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </>
+            ) : (
+              <p className="empty-state">Click Start to run value iteration.</p>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'expectimax' && (
+          <section className="card full-span-card algorithm-panel">
+            <div className="section-heading">
+              <h2>Expectimax (MDP)</h2>
+              <p>
+                Finite-horizon search alternating max (agent) and chance (stuck tile) nodes.
+                Start: <strong>{currentTile}</strong> · Goal: <strong>{goalTile}</strong>
+              </p>
+            </div>
+            <ColorLegend />
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>Expectimax recursion.</strong> At a max node the agent picks the
+                action with the highest expected child value. At a chance node we average
+                over stochastic outcomes weighted by the transition probability.
+              </p>
+              <Eq>
+                {'\\cV{V_h}(\\cS{s}) = \\max_{\\cA{a}} \\sum_{\\cS{s\'}} \\cT{T}(\\cS{s},\\cA{a},\\cS{s\'})\\bigl[\\cR{R}(\\cS{s},\\cA{a},\\cS{s\'}) + \\cG{\\gamma}\\,\\cV{V_{h-1}}(\\cS{s\'})\\bigr]'}
+              </Eq>
+              <p className="equation-caption">
+                When the horizon h reaches 0 we cut off with <IEq>{'\\cV{V_0}(\\cS{s})=0'}</IEq>
+                (except terminal tiles, which keep their immediate reward).
+                The root action is <IEq>{'\\arg\\max_{\\cA{a}} Q_h(\\cS{s},\\cA{a})'}</IEq>.
+              </p>
+            </div>
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>Expectimax vs. Value Iteration.</strong> The Bellman equation is
+                the same — the difference is <em>how</em> it's solved.
+              </p>
+              <ul className="equation-caption">
+                <li>
+                  <strong>VI (bottom-up, global).</strong> Stores one{' '}
+                  <IEq>{'\\cV{V}(\\cS{s})'}</IEq> per state and sweeps every state each
+                  iteration, reusing the most recent estimates. Runs until convergence
+                  over an infinite horizon. Cost per sweep:{' '}
+                  <IEq>{'O(|\\cS{S}|\\,|\\cA{A}|)'}</IEq>.
+                </li>
+                <li>
+                  <strong>Expectimax (top-down, local).</strong> Builds a fresh search
+                  tree rooted at the <em>current</em> state and recurses to a fixed
+                  horizon h. No state is shared across siblings — the same tile can be
+                  re-expanded many times at different depths. Cost:{' '}
+                  <IEq>{'O\\bigl((|\\cA{A}|\\cdot b)^{h}\\bigr)'}</IEq> where b is the
+                  transition branching factor.
+                </li>
+                <li>
+                  <strong>What you see here.</strong> The expectimax tab draws the actual
+                  tree — one root max node, one max node per reachable state at each
+                  depth, with chance nodes in between. The VI tab just shows a grid of
+                  V(s) values and arrows, because there is no tree — only a table.
+                </li>
+                <li>
+                  <strong>When to prefer which.</strong> Use VI (or policy iteration)
+                  when you need the optimal policy everywhere and the state space fits
+                  in memory. Use expectimax / receding-horizon planning when the state
+                  space is huge but only the current state's best action matters right
+                  now.
+                </li>
+              </ul>
+            </div>
+            {expectimaxResult && expectimaxDiagram ? (
+              <>
+                <p className="vi-summary">
+                  Root V = {expectimaxResult.root.value.toFixed(2)} · best action:{' '}
+                  {expectimaxResult.root.bestAction
+                    ? describeAction(expectimaxResult.root.bestAction)
+                    : '(terminal)'}{' '}
+                  · horizon = {expectimaxResult.horizon} · γ = {expectimaxResult.gamma} · nodes = {expectimaxResult.nodes.length}
+                </p>
+                <div className="expectimax-flow">
+                  <ReactFlow
+                    nodes={expectimaxDiagram.nodes}
+                    edges={expectimaxDiagram.edges}
+                    nodeTypes={expectimaxNodeTypes}
+                    fitView
+                    fitViewOptions={{ padding: 0.15 }}
+                    nodesDraggable={false}
+                    nodesConnectable={false}
+                    elementsSelectable={false}
+                    zoomOnDoubleClick={false}
+                    minZoom={0.15}
+                    maxZoom={1.6}
+                    proOptions={{ hideAttribution: true }}
+                  >
+                    <Background gap={24} color="#d9e1ee" />
+                    <Controls showInteractive={false} position="top-right" />
+                  </ReactFlow>
+                </div>
+                <p className="vi-legend">
+                  Blue edges = agent action (Q-value). Purple dashed edges = chance outcomes (probability × reward).
+                  Leaves cut off at horizon contribute V=0.
+                </p>
+                <details open className="per-step-details">
+                  <summary>Action values at the root {expectimaxResult.root.tile}</summary>
+                  <div className="step-table-scroll">
+                    <table className="step-table">
+                      <thead>
+                        <tr>
+                          <th>Action a</th>
+                          <th>Q(root, a)</th>
+                          <th>Chance children</th>
+                          <th>Best?</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {expectimaxResult.root.children.map((child) => {
+                          const chance = child.node as ExpectimaxChanceNode
+                          const chanceText = chance.children
+                            .map(
+                              (c) =>
+                                `${c.node.tile} (p=${c.probability.toFixed(2)}, r=${c.reward.toFixed(2)})`,
+                            )
+                            .join(' + ')
+                          const isBest = expectimaxResult.root.bestAction === child.action
+                          return (
+                            <tr key={child.action} className={isBest ? 'step-table-goal' : ''}>
+                              <td>{describeAction(child.action)}</td>
+                              <td className="num">{child.q.toFixed(3)}</td>
+                              <td className="step-table-small">{chanceText}</td>
+                              <td>{isBest ? '★' : ''}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+                <details className="per-step-details">
+                  <summary>
+                    All internal nodes ({expectimaxResult.nodes.filter((n) => n.kind !== 'leaf').length}{' '}
+                    max/chance nodes)
+                  </summary>
+                  <div className="step-table-scroll">
+                    <table className="step-table">
+                      <thead>
+                        <tr>
+                          <th>Node</th>
+                          <th>Kind</th>
+                          <th>Tile</th>
+                          <th>Depth</th>
+                          <th>Horizon left</th>
+                          <th>V / E[Q]</th>
+                          <th>Best action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {expectimaxResult.nodes
+                          .filter((n) => n.kind !== 'leaf')
+                          .map((n) => (
+                            <tr key={n.id}>
+                              <td>{n.id}</td>
+                              <td>{n.kind}</td>
+                              <td>{n.tile}</td>
+                              <td>{n.depth}</td>
+                              <td>{n.horizonRemaining}</td>
+                              <td className="num">{n.value.toFixed(3)}</td>
+                              <td>
+                                {n.kind === 'max' && n.bestAction
+                                  ? `${actionArrow(n.bestAction)} ${n.bestAction}`
+                                  : n.kind === 'chance'
+                                    ? describeAction(n.action)
+                                    : '—'}
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </>
+            ) : (
+              <p className="empty-state">Click Start to build the expectimax tree.</p>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'pomdp' && (
+          <section className="card full-span-card algorithm-panel">
+            <div className="section-heading">
+              <h2>POMDP (Q_MDP approximation)</h2>
+              <p>
+                Agent does not know its own tile. Its observation each step is the{' '}
+                <strong>type of the tile it is standing on</strong> (Normal, Stuck,
+                Trap, or Goal), reported correctly with probability p and otherwise
+                uniformly distributed over the other three.
+              </p>
+            </div>
+            <ColorLegend />
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>Observation model <IEq>{'\\cZ{P}(\\cO{o} \\mid \\cS{s\'})'}</IEq>.</strong>{' '}
+                This is the probability that, after landing in state{' '}
+                <IEq>{'\\cS{s\'}'}</IEq>, the sensor reports observation{' '}
+                <IEq>{'\\cO{o}'}</IEq>. It is the POMDP analogue of the transition
+                model <IEq>{'\\cT{T}'}</IEq>, but for observations instead of next
+                states. In general it can depend on the action:{' '}
+                <IEq>{'\\cZ{P}(\\cO{o} \\mid \\cS{s\'},\\cA{a})'}</IEq>.
+              </p>
+              <p className="equation-caption">
+                In this gridworld the observation{' '}
+                <IEq>{'\\cO{o} \\in \\{\\text{Normal}, \\text{Stuck}, \\text{Trap}, \\text{Goal}\\}'}</IEq>{' '}
+                is the reported label of the tile the agent is standing on (the goal
+                tile reports Goal; every other tile reports its own type). With
+                probability <IEq>{'p'}</IEq> the label matches the truth; with
+                probability <IEq>{'1-p'}</IEq> it is one of the other three labels,
+                uniformly:
+              </p>
+              <Eq>
+                {'\\cZ{P}(\\cO{o} \\mid \\cS{s\'}) = \\begin{cases} p & \\cO{o}=\\text{label}(\\cS{s\'}) \\\\ (1-p)/3 & \\text{otherwise} \\end{cases}'}
+              </Eq>
+            </div>
+            <div className="equation-block">
+              <p className="equation-caption">
+                <strong>Belief propagation (predict).</strong> After taking action{' '}
+                <IEq>{'\\cA{a}'}</IEq>, push the belief through the transition model:
+              </p>
+              <Eq>{'\\cB{b\'}(\\cS{s\'}) = \\sum_{\\cS{s}} \\cT{T}(\\cS{s},\\cA{a},\\cS{s\'})\\,\\cB{b}(\\cS{s})'}</Eq>
+              <p className="equation-caption">
+                <strong>Bayes correct.</strong> After observing <IEq>{'\\cO{o}'}</IEq>{' '}
+                (the tile type at the current location), multiply by the observation
+                likelihood and renormalise:
+              </p>
+              <Eq>{'\\cB{b}_{\\cA{a},\\cO{o}}(\\cS{s\'}) \\propto \\cZ{P}(\\cO{o} \\mid \\cS{s\'})\\,\\cB{b\'}(\\cS{s\'})'}</Eq>
+              <p className="equation-caption">
+                <strong>Q<sub>MDP</sub> policy.</strong> Solve the fully-observable MDP to
+                get <IEq>{'Q^*(\\cS{s},\\cA{a})'}</IEq>, then act by the belief-weighted
+                average. This is an <em>upper bound</em> — it assumes full observability
+                starting next step:
+              </p>
+              <Eq>{'\\pi_{\\text{Q}_{\\text{MDP}}}(\\cB{b}) = \\arg\\max_{\\cA{a}} \\sum_{\\cS{s}} \\cB{b}(\\cS{s})\\,Q^*(\\cS{s},\\cA{a})'}</Eq>
+            </div>
+            {pomdpResult && pomdpCurrentFrame ? (
+              <>
+                <div className="vi-controls">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setPomdpFrameIndex(0)}
+                    disabled={pomdpFrameIndex === 0}
+                  >
+                    Start
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setPomdpFrameIndex((i) => Math.max(0, i - 1))}
+                    disabled={pomdpFrameIndex === 0}
+                  >
+                    Prev
+                  </button>
+                  <input
+                    type="range"
+                    min={0}
+                    max={pomdpResult.frames.length - 1}
+                    value={pomdpFrameIndex}
+                    onChange={(event) => setPomdpFrameIndex(Number(event.target.value))}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() =>
+                      setPomdpFrameIndex((i) =>
+                        Math.min(pomdpResult.frames.length - 1, i + 1),
+                      )
+                    }
+                    disabled={pomdpFrameIndex >= pomdpResult.frames.length - 1}
+                  >
+                    Next
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setPomdpFrameIndex(pomdpResult.frames.length - 1)}
+                    disabled={pomdpFrameIndex >= pomdpResult.frames.length - 1}
+                  >
+                    End
+                  </button>
+                </div>
+                <p className="vi-summary">
+                  Frame {pomdpFrameIndex + 1} / {pomdpResult.frames.length} · phase:{' '}
+                  <strong>{pomdpCurrentFrame.phase}</strong> · true tile:{' '}
+                  <strong>{pomdpCurrentFrame.trueTile}</strong>
+                  {pomdpCurrentFrame.observation ? ` · observation: ${observationLabel(pomdpCurrentFrame.observation)}` : ''}
+                  {pomdpCurrentFrame.action ? ` · action: ${describeAction(pomdpCurrentFrame.action)}` : ''}
+                </p>
+                <p className="pomdp-message">{pomdpCurrentFrame.message}</p>
+                <BeliefBoard
+                  belief={pomdpCurrentFrame.belief}
+                  trueTile={pomdpCurrentFrame.trueTile}
+                  goalTile={pomdpResult.goalTile}
+                />
+                {pomdpCurrentFrame.action && (
+                  <details open className="per-step-details">
+                    <summary>
+                      Q<sub>MDP</sub>(b, a) values chosen at this step
+                    </summary>
+                    <div className="step-table-scroll">
+                      <table className="step-table">
+                        <thead>
+                          <tr>
+                            <th>Action a</th>
+                            <th>Σ b(s)·Q*(s,a)</th>
+                            <th>Chosen?</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(['up', 'down', 'left', 'right'] as Action[]).map((a) => {
+                            const v = pomdpCurrentFrame.qmdpValues[a]
+                            const chosen = pomdpCurrentFrame.action === a
+                            return (
+                              <tr key={a} className={chosen ? 'step-table-goal' : ''}>
+                                <td>{describeAction(a)}</td>
+                                <td className="num">{v !== undefined ? v.toFixed(3) : '—'}</td>
+                                <td>{chosen ? '★' : ''}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                )}
+                <details className="per-step-details">
+                  <summary>Belief table b(s) at this step</summary>
+                  <div className="step-table-scroll">
+                    <table className="step-table">
+                      <thead>
+                        <tr>
+                          <th>Tile</th>
+                          <th>Type</th>
+                          <th>b(s)</th>
+                          <th>Q*(s, up)</th>
+                          <th>Q*(s, down)</th>
+                          <th>Q*(s, left)</th>
+                          <th>Q*(s, right)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getAllTiles().map((tile) => {
+                          const b = pomdpCurrentFrame.belief[tile] ?? 0
+                          const Qrow = pomdpResult.finalSnapshot.Q[tile]
+                          return (
+                            <tr
+                              key={tile}
+                              className={
+                                tile === pomdpCurrentFrame.trueTile
+                                  ? 'step-table-goal'
+                                  : ''
+                              }
+                            >
+                              <td>{tile}</td>
+                              <td>{getTileType(tile)}</td>
+                              <td className="num">{(b * 100).toFixed(1)}%</td>
+                              {(['up', 'down', 'left', 'right'] as Action[]).map((a) => (
+                                <td key={a} className="num">
+                                  {Qrow[a].toFixed(2)}
+                                </td>
+                              ))}
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+                <details className="per-step-details">
+                  <summary>All frames in this episode</summary>
+                  <div className="step-table-scroll">
+                    <table className="step-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Step</th>
+                          <th>Phase</th>
+                          <th>Action</th>
+                          <th>Obs</th>
+                          <th>True tile</th>
+                          <th>Max b(s)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pomdpResult.frames.map((frame, index) => {
+                          let maxTile = '' as string
+                          let maxP = -1
+                          for (const t of getAllTiles()) {
+                            const p = frame.belief[t] ?? 0
+                            if (p > maxP) {
+                              maxP = p
+                              maxTile = t
+                            }
+                          }
+                          return (
+                            <tr
+                              key={index}
+                              className={index === pomdpFrameIndex ? 'step-table-goal' : ''}
+                              onClick={() => setPomdpFrameIndex(index)}
+                              style={{ cursor: 'pointer' }}
+                            >
+                              <td>{index + 1}</td>
+                              <td>{frame.step}</td>
+                              <td>{frame.phase}</td>
+                              <td>{frame.action ? describeAction(frame.action) : '—'}</td>
+                              <td>{frame.observation ? observationLabel(frame.observation) : '—'}</td>
+                              <td>{frame.trueTile}</td>
+                              <td className="num">
+                                {maxTile} ({(maxP * 100).toFixed(1)}%)
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+                <details className="per-step-details">
+                  <summary>Underlying MDP Q* values used by Q<sub>MDP</sub></summary>
+                  <p className="equation-caption">
+                    These are computed once by value iteration over the fully-observable
+                    MDP with γ = {pomdpResult.gamma}. Q<sub>MDP</sub> then averages them
+                    against the current belief.
+                  </p>
+                  <div className="step-table-scroll">
+                    <table className="step-table">
+                      <thead>
+                        <tr>
+                          <th>Tile</th>
+                          <th>V*(s)</th>
+                          <th>Q*(s, up)</th>
+                          <th>Q*(s, down)</th>
+                          <th>Q*(s, left)</th>
+                          <th>Q*(s, right)</th>
+                          <th>π*(s)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getAllTiles().map((tile) => {
+                          const Qrow = pomdpResult.finalSnapshot.Q[tile]
+                          const best = pomdpResult.finalSnapshot.policy[tile]
+                          return (
+                            <tr key={tile}>
+                              <td>{tile}</td>
+                              <td className="num">
+                                {formatV(pomdpResult.finalSnapshot.V[tile])}
+                              </td>
+                              {(['up', 'down', 'left', 'right'] as Action[]).map((a) => (
+                                <td
+                                  key={a}
+                                  className={`num${best === a ? ' step-table-best' : ''}`}
+                                >
+                                  {Qrow[a].toFixed(2)}
+                                </td>
+                              ))}
+                              <td>{best ? `${actionArrow(best)} ${best}` : '—'}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+                {pomdpResult.terminated && (
+                  <p className="vi-legend">
+                    Episode terminated: {pomdpResult.terminationReason}.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="empty-state">
+                Click Start to run the POMDP simulation. The agent starts with a uniform belief,
+                sees a noisy tile-type observation, and plans with Q<sub>MDP</sub>.
+              </p>
+            )}
           </section>
         )}
       </div>
